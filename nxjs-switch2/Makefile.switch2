@@ -1,0 +1,212 @@
+#---------------------------------------------------------------------------------
+# Switch 2 (kaiHEN / ounce-devkit) Makefile for nx.js
+#
+# Uses libounce + OunceVK (Vulkan/EGL/GLES3) + libkaihen (JIT).
+# Place/run inside upstream/nx.js:
+#   make -f ../../nxjs-switch2/Makefile.switch2 V=1
+#---------------------------------------------------------------------------------
+.SUFFIXES:
+#---------------------------------------------------------------------------------
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=/opt/devkitpro")
+endif
+
+export PATH := $(DEVKITPRO)/portlibs/switch2/bin:$(DEVKITPRO)/portlibs/switch/bin:$(DEVKITPRO)/devkitA64/bin:$(DEVKITPRO)/tools/bin:$(PATH)
+PKG_CONFIG := $(DEVKITPRO)/portlibs/switch2/bin/aarch64-none-elf-pkg-config
+
+TOPDIR ?= $(CURDIR)
+include $(DEVKITPRO)/libounce/switch2_rules
+
+APP_TITLE   :=  Demons Roots
+APP_TITLEID :=  0164726f6f747300
+APP_AUTHOR  :=  Demons Roots Switch 2 Port
+APP_VERSION :=  1.03
+LIBNX_VERSION := $(shell $(DEVKITPRO)/pacman/bin/pacman -Q libounce 2>/dev/null | cut -d' ' -f2 | cut -d'-' -f1)
+ifeq ($(strip $(LIBNX_VERSION)),)
+LIBNX_VERSION := 2.0.0-ounce
+endif
+LIBTURBOJPEG_VERSION := $(shell $(DEVKITPRO)/pacman/bin/pacman -Q switch-libjpeg-turbo 2>/dev/null | cut -d' ' -f2 | cut -d'-' -f1)
+ifeq ($(strip $(LIBTURBOJPEG_VERSION)),)
+LIBTURBOJPEG_VERSION := unknown
+endif
+
+TARGET		:=	nxjs-switch2
+BUILD		:=	build-switch2
+SOURCES		:=	source
+DATA		:=	data
+INCLUDES	:=	include
+ROMFS		:=	romfs
+
+#---------------------------------------------------------------------------------
+# Switch 2 CPU code generation (Cortex-A78C + crypto from libounce/switch2_cpu.mk)
+#---------------------------------------------------------------------------------
+ARCH	:=	$(SWITCH2_CPU) -mtp=soft -fPIE
+
+UV_CFLAGS	:=	$(shell $(PKG_CONFIG) --cflags libuv)
+UV_LIBS		:=	$(shell $(PKG_CONFIG) --libs libuv)
+
+CFLAGS	:=	-g -Wall -O2 -ffunction-sections \
+			$(ARCH) $(DEFINES) -DNXJS_VERSION="\"$(APP_VERSION)\"" \
+			-DLIBNX_VERSION="\"$(LIBNX_VERSION)\"" \
+			-DLIBTURBOJPEG_VERSION="\"$(LIBTURBOJPEG_VERSION)\""
+
+CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D__SWITCH2__ -D_DEFAULT_SOURCE $(UV_CFLAGS) \
+			`$(PKG_CONFIG) freetype2 --cflags`
+
+SKIA_CFLAGS	:=	-DSK_GL -DSK_BUILD_FOR_UNIX -I$(PORTLIBS)/include/skia
+
+CXXFLAGS	:=	$(CFLAGS) $(SKIA_CFLAGS) -fno-rtti -fno-exceptions -std=c++20 \
+			-Wno-comment -Wno-attributes -Wno-strict-aliasing
+
+ASFLAGS	:=	-g $(ARCH)
+LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+
+# Link our Switch 2 PAC-stripped v8_snapshot_nopac.o BEFORE -lv8_monolith so
+# Cortex-A78C does not PAC-tag LR inside V8 embedded builtins.
+V8_LIBS		:=	$(TOPDIR)/$(BUILD)/v8_snapshot_nopac.o \
+			-Wl,--start-group -lv8_monolith -labsl -lchrome_zlib -lcompression_utils_portable -Wl,--end-group
+
+SKIA_LIBS	:=	$(PORTLIBS)/lib/skia-horizon-port.o \
+			-Wl,--start-group -lskia-gl -lskcms-gl -lskshaper-gl \
+			-lskunicode_core-gl -lskunicode_libgrapheme-gl -Wl,--end-group
+
+# OunceVK provides libEGL.a (Zink + NVK) and empty shadows for GLESv2/glapi/drm_nouveau
+# via OVERLAY_LIBPATHS (-L$(PORTLIBS_SWITCH2)/lib) set by switch2_rules.
+GL_LIBS		:=	-lEGL -lGLESv2 -lglapi -ldrm_nouveau
+
+FFMPEG_LIBS	:=	-lavformat -lavcodec -lswscale -lswresample -lavutil -lavif -ldav1d
+
+# Link -lkaihen (kaihen-jit.o) before -lnx (libounce) so libounce's weak JIT hooks bind to kaiHEN RO.
+LIBS	:=  $(SKIA_LIBS) $(V8_LIBS) $(UV_LIBS) $(GL_LIBS) \
+			$(FFMPEG_LIBS) \
+			-lmbedtls -lmbedx509 -lmbedcrypto \
+			-Wl,--start-group -lfreetype -lharfbuzz -Wl,--end-group \
+			-lturbojpeg -lwebp -lwebpdemux -ljpeg -lpng -lbz2 -lz -lm -lzstd \
+			-lada \
+			-lkaihen -lnx
+
+LIBDIRS	:= $(PORTLIBS_SWITCH2) $(PORTLIBS) $(LIBNX)
+
+#---------------------------------------------------------------------------------
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+#---------------------------------------------------------------------------------
+
+export OUTPUT	:=	$(CURDIR)/$(TARGET)
+export TOPDIR	:=	$(CURDIR)
+
+export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
+			$(foreach dir,$(DATA),$(CURDIR)/$(dir))
+
+export DEPSDIR	:=	$(CURDIR)/$(BUILD)
+
+CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+CCFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cc)))
+SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
+BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+
+ifneq ($(filter runtime_js.c,$(CFILES)),runtime_js.c)
+	CFILES := $(CFILES) runtime_js.c
+endif
+
+ifeq ($(strip $(CPPFILES)$(CCFILES)),)
+	export LD	:=	$(CC)
+else
+	export LD	:=	$(CXX)
+endif
+
+export OFILES_BIN	:=	$(addsuffix .o,$(BINFILES))
+export OFILES_SRC	:=	$(CPPFILES:.cpp=.o) $(CCFILES:.cc=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+export OFILES 	:=	$(OFILES_BIN) $(OFILES_SRC)
+export HFILES_BIN	:=	$(addsuffix .h,$(subst .,_,$(BINFILES)))
+
+export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
+			$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+			-I$(CURDIR)/$(BUILD)
+
+export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+ifeq ($(strip $(ICON)),)
+	icons := $(wildcard *.jpg)
+	ifneq (,$(findstring $(TARGET).jpg,$(icons)))
+		export APP_ICON := $(TOPDIR)/$(TARGET).jpg
+	else
+		ifneq (,$(findstring icon.jpg,$(icons)))
+			export APP_ICON := $(TOPDIR)/icon.jpg
+		endif
+	endif
+else
+	export APP_ICON := $(TOPDIR)/$(ICON)
+endif
+
+ifeq ($(strip $(NO_ICON)),)
+	export NROFLAGS += --icon=$(APP_ICON)
+endif
+
+ifeq ($(strip $(NO_NACP)),)
+	export NROFLAGS += --nacp=$(CURDIR)/$(TARGET).nacp
+endif
+
+ifneq ($(APP_TITLEID),)
+	export NACPFLAGS += --titleid=$(APP_TITLEID)
+endif
+
+ifneq ($(ROMFS),)
+	export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
+endif
+
+.PHONY: $(BUILD) clean all
+
+all: $(BUILD)
+
+$(SOURCES)/runtime_js.c: packages/runtime/runtime.js tools/embed-runtime.mjs
+	@node tools/embed-runtime.mjs packages/runtime/runtime.js $(SOURCES)/runtime_js.c
+	@echo "embedded 'packages/runtime/runtime.js' -> '$(SOURCES)/runtime_js.c'"
+
+$(ROMFS)/runtime.js.map: packages/runtime/runtime.js.map
+	@mkdir -p $(ROMFS)
+	@cp -v packages/runtime/runtime.js.map $(ROMFS)
+
+GEIST_MONO_TTF := packages/runtime/node_modules/geist/dist/fonts/geist-mono/GeistMono-Regular.ttf
+$(ROMFS)/GeistMono.ttf: $(GEIST_MONO_TTF)
+	@mkdir -p $(ROMFS)
+	@cp -v $(GEIST_MONO_TTF) $(ROMFS)/GeistMono.ttf
+
+$(BUILD): source/runtime_js.c romfs/runtime.js.map romfs/GeistMono.ttf
+	@[ -d $@ ] || mkdir -p $@
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/../../nxjs-switch2/Makefile.switch2
+
+clean:
+	@echo clean switch2 ...
+	@rm -fr $(BUILD) $(TARGET).nro $(TARGET).nacp $(TARGET).elf
+
+#---------------------------------------------------------------------------------
+else
+.PHONY:	all
+
+DEPENDS	:=	$(OFILES:.o=.d)
+
+all	: $(OUTPUT).nro
+
+ifeq ($(strip $(NO_NACP)),)
+$(OUTPUT).nro	:	$(OUTPUT).elf $(OUTPUT).nacp
+else
+$(OUTPUT).nro	:	$(OUTPUT).elf
+endif
+
+$(OUTPUT).elf	:	$(OFILES)
+
+$(OFILES_SRC)	: $(HFILES_BIN)
+
+%.o: %.cc
+	@echo $(notdir $<)
+	$(SILENTCMD)$(CXX) -MMD -MP -MF $(DEPSDIR)/$*.d $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@ $(ERROR_FILTER)
+
+%.bin.o	%_bin.h :	%.bin
+	@echo $(notdir $<)
+	@$(bin2o)
+
+-include $(DEPENDS)
+
+endif

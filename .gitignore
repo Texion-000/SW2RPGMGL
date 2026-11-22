@@ -1,0 +1,25 @@
+# Built release artifacts & binaries (upload NROs via GitHub Releases instead of git history)
+dist/
+*.nro
+*.elf
+*.nacp
+*.map
+*.o
+*.d
+*.a
+
+# Upstream source clones (fetched by scripts/wsl-setup-and-build.sh & scripts/wsl-build-mkxpz.sh)
+upstream/
+
+# Build & bundler outputs
+launcher/build-switch2/
+loader/romfs/main.js
+loader/romfs/mz-main.js
+**/node_modules/
+**/__pycache__/
+*.pyc
+
+# Logs & OS junk
+*.log
+.DS_Store
+Thumbs.db
