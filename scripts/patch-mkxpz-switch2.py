@@ -1949,6 +1949,723 @@ def patch_binding_mri_syntax() -> None:
     )
 
 
+def patch_binding_rgss18_retry() -> None:
+    # Ruby 1.8 (RPG Maker XP) syntax that Ruby 3.1 rejects, e.g. UMS's `{'\.', '\p[4]', ...}` hash literal
+    # or `when 1: foo`. On SyntaxError, rewrite the section and evaluate it once more (a SyntaxError means
+    # nothing in that section ran yet, so the retry is side-effect free).
+    header_src = Path(__file__).resolve().parent / "mkxpz" / "switch2-rgss18-compat.h"
+    write_if_changed(ROOT / "binding" / "switch2-rgss18-compat.h", header_src.read_text(encoding="utf-8"))
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss18-retry]",
+        [
+            (
+                '#include "binding-util.h"\n',
+                '#include "binding-util.h"\n'
+                '#include "switch2-rgss18-compat.h" // [switch2-rgss18-retry]\n',
+            ),
+            (
+                "            evalString(string, fname, &state);\n"
+                "            if (state) {\n"
+                "                VALUE err = rb_errinfo();",
+                "            evalString(string, fname, &state);\n"
+                "            if (state) {\n"
+                "                VALUE err0 = rb_errinfo();\n"
+                "                if (!NIL_P(err0) && rb_obj_is_kind_of(err0, rb_eSyntaxError)) {\n"
+                "                    std::string src0(RSTRING_PTR(string), RSTRING_LEN(string));\n"
+                "                    int hashFixes = 0, whenFixes = 0;\n"
+                "                    std::string fixed = switch2_rgss18::rewrite(src0, &hashFixes, &whenFixes);\n"
+                "                    if (hashFixes + whenFixes > 0) {\n"
+                "                        Debug() << \"[rgss18] Ruby 1.8 syntax in\" << buf << \"-> retrying with\"\n"
+                "                                << hashFixes << \"hash literal(s) and\" << whenFixes << \"`when x:` rewrite(s)\";\n"
+                "                        VALUE string2 = newStringUTF8(fixed.c_str(), fixed.size());\n"
+                "                        rb_set_errinfo(Qnil);\n"
+                "                        int state2 = 0;\n"
+                "                        evalString(string2, fname, &state2);\n"
+                "                        state = state2;\n"
+                "                        string = string2;\n"
+                "                        if (!state)\n"
+                "                            rb_ary_store(script, 3, string2);\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "            if (state) {\n"
+                "                VALUE err = rb_errinfo();",
+            ),
+        ],
+    )
+    # v2: also count byte-level UTF-8 regexp conversions (Pokemon Uranium's CJK Utilities word wrap)
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss18-retry-v2]",
+        [
+            (
+                "                    int hashFixes = 0, whenFixes = 0;\n"
+                "                    std::string fixed = switch2_rgss18::rewrite(src0, &hashFixes, &whenFixes);\n"
+                "                    if (hashFixes + whenFixes > 0) {\n"
+                "                        Debug() << \"[rgss18] Ruby 1.8 syntax in\" << buf << \"-> retrying with\"\n"
+                "                                << hashFixes << \"hash literal(s) and\" << whenFixes << \"`when x:` rewrite(s)\";\n",
+                "                    // [switch2-rgss18-retry-v2]\n"
+                "                    int hashFixes = 0, whenFixes = 0, regexFixes = 0;\n"
+                "                    std::string fixed = switch2_rgss18::rewrite(src0, &hashFixes, &whenFixes, &regexFixes);\n"
+                "                    if (hashFixes + whenFixes + regexFixes > 0) {\n"
+                "                        Debug() << \"[rgss18] Ruby 1.8 syntax in\" << buf << \"-> retrying with\"\n"
+                "                                << hashFixes << \"hash literal(s),\" << whenFixes << \"`when x:` and\"\n"
+                "                                << regexFixes << \"byte regexp rewrite(s)\";\n",
+            ),
+        ],
+    )
+
+
+def patch_binding_rgss18_retry_v3() -> None:
+    # v3: also count Ruby 1.8 `obj.method (a, b)` spaced-paren call rewrites (To the Moon's Mouse /
+    # paragraph formatter scripts), which alone must trigger the retry as well.
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss18-retry-v3]",
+        [
+            (
+                "                    int hashFixes = 0, whenFixes = 0, regexFixes = 0;\n"
+                "                    std::string fixed = switch2_rgss18::rewrite(src0, &hashFixes, &whenFixes, &regexFixes);\n"
+                "                    if (hashFixes + whenFixes + regexFixes > 0) {\n",
+                "                    // [switch2-rgss18-retry-v3]\n"
+                "                    int hashFixes = 0, whenFixes = 0, regexFixes = 0, callFixes = 0;\n"
+                "                    std::string fixed = switch2_rgss18::rewrite(src0, &hashFixes, &whenFixes, &regexFixes, &callFixes);\n"
+                "                    if (hashFixes + whenFixes + regexFixes + callFixes > 0) {\n"
+                "                        if (callFixes > 0)\n"
+                "                            Debug() << \"[rgss18]\" << buf << \":\" << callFixes << \"spaced-paren call rewrite(s)\";\n",
+            ),
+        ],
+    )
+
+
+def patch_binding_runtime_error_context() -> None:
+    # When a script section dies with a runtime error (NoMethodError etc.), print the failing source lines
+    # of the section named in the first backtrace frame, like the SyntaxError context dump does.
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-runtime-error-context]",
+        [
+            (
+                "                        Debug() << \"--- End SyntaxError context ---\";\n"
+                "                    }\n"
+                "                }\n"
+                "                break;\n",
+                "                        Debug() << \"--- End SyntaxError context ---\";\n"
+                "                    }\n"
+                "                } else if (!NIL_P(err) && !rb_obj_is_kind_of(err, rb_eSystemExit) &&\n"
+                "                           !rb_obj_is_kind_of(err, getRbData()->exc[Reset])) {\n"
+                "                    // [switch2-runtime-error-context]\n"
+                "                    VALUE bt = rb_funcall2(err, rb_intern(\"backtrace\"), 0, NULL);\n"
+                "                    if (RB_TYPE_P(bt, T_ARRAY) && RARRAY_LEN(bt) > 0 && RB_TYPE_P(rb_ary_entry(bt, 0), T_STRING)) {\n"
+                "                        VALUE f0 = rb_ary_entry(bt, 0);\n"
+                "                        std::string fr(RSTRING_PTR(f0), RSTRING_LEN(f0));\n"
+                "                        size_t inPos = fr.rfind(\":in \");\n"
+                "                        if (inPos == std::string::npos) inPos = fr.size();\n"
+                "                        size_t lc = fr.rfind(':', inPos ? inPos - 1 : 0);\n"
+                "                        char *endp = NULL;\n"
+                "                        long secIdx = strtol(fr.c_str(), &endp, 10);\n"
+                "                        long errLine = (lc != std::string::npos) ? strtol(fr.c_str() + lc + 1, NULL, 10) : 0;\n"
+                "                        if (endp && *endp == ':' && endp != fr.c_str() && secIdx >= 0 && secIdx < scriptCount && errLine > 0) {\n"
+                "                            VALUE sec = rb_ary_entry(scriptArray, secIdx);\n"
+                "                            VALUE secSrc = rb_ary_entry(sec, 3);\n"
+                "                            if (RB_TYPE_P(secSrc, T_STRING)) {\n"
+                "                                const char *src = RSTRING_PTR(secSrc);\n"
+                "                                long srclen = RSTRING_LEN(secSrc);\n"
+                "                                long startL = errLine > 12 ? errLine - 12 : 1;\n"
+                "                                long endL = errLine + 6;\n"
+                "                                Debug() << \"--- Runtime error context in\" << fr.substr(0, inPos) << \"---\";\n"
+                "                                long curL = 1, pos = 0;\n"
+                "                                while (pos < srclen && curL <= endL) {\n"
+                "                                    long nl = pos;\n"
+                "                                    while (nl < srclen && src[nl] != '\\n') ++nl;\n"
+                "                                    if (curL >= startL) {\n"
+                "                                        std::string lineStr(src + pos, nl - pos);\n"
+                "                                        Debug() << (curL == errLine ? \">>\" : \"  \") << curL << \":\" << lineStr;\n"
+                "                                    }\n"
+                "                                    pos = nl + 1;\n"
+                "                                    ++curL;\n"
+                "                                }\n"
+                "                                Debug() << \"--- End runtime error context ---\";\n"
+                "                            }\n"
+                "                        }\n"
+                "                    }\n"
+                "                }\n"
+                "                break;\n",
+            ),
+        ],
+    )
+
+
+def patch_preload_stdlib_env_shims() -> None:
+    # 1. `require 'timeout'` (Pokemon Reborn & other Essentials forks): mkxp-z ships no Ruby stdlib, and a
+    #    real Timeout needs a preemptive timer thread (unavailable here: "pipe creation failed for timer").
+    #    Provide a run-to-completion Timeout and mark it loaded so `require` succeeds.
+    # 2. Windows environment variables (APPDATA, USERPROFILE, ...) that XP/VX save & launcher scripts read
+    #    with ENV[...]; on Switch they are nil, which crashes scripts calling e.g. `.rstrip` on them.
+    stub_p = ROOT / "switch/romfs-root/preload/win32api_stub.rb"
+    stext = stub_p.read_text(encoding="utf-8")
+    marker = "# [switch2-stdlib-env-shims-v1]"
+    if marker in stext:
+        print(f"[ok] {stub_p} already patched ({marker})")
+        return
+    addition = r'''
+# [switch2-stdlib-env-shims-v1]
+unless defined?(Timeout) && Timeout.respond_to?(:timeout)
+	module Timeout
+		class Error < RuntimeError; end
+		ExitException = Error unless const_defined?(:ExitException)
+		# No preemptive timer thread on Switch: run the block to completion.
+		def self.timeout(sec = nil, klass = nil, message = nil)
+			yield(sec)
+		end
+	end
+end
+unless $LOADED_FEATURES.any? { |f| f == "timeout.rb" || f.end_with?("/timeout.rb") }
+	$LOADED_FEATURES << "timeout.rb"
+end
+
+begin
+	__sw2_home = File.join(Dir.pwd, "userdata")
+	__sw2_env = {
+		"USERPROFILE" => __sw2_home,
+		"HOME" => __sw2_home,
+		"HOMEDRIVE" => "",
+		"HOMEPATH" => __sw2_home,
+		"APPDATA" => File.join(__sw2_home, "AppData", "Roaming"),
+		"LOCALAPPDATA" => File.join(__sw2_home, "AppData", "Local"),
+		"TEMP" => File.join(__sw2_home, "Temp"),
+		"TMP" => File.join(__sw2_home, "Temp"),
+		"USERNAME" => "Player",
+		"COMPUTERNAME" => "SWITCH2",
+		"OS" => "Windows_NT",
+	}
+	__sw2_set = []
+	__sw2_env.each do |k, v|
+		cur = ENV[k]
+		next if cur && !cur.empty?
+		ENV[k] = v
+		__sw2_set << k
+	end
+	["APPDATA", "LOCALAPPDATA", "TEMP"].each do |k|
+		next unless __sw2_set.include?(k)
+		path = ""
+		ENV[k].split("/").each do |part|
+			next if part.empty?
+			path = path.empty? && ENV[k].start_with?("/") ? "/" + part : (path.empty? ? part : path + "/" + part)
+			Dir.mkdir(path) unless File.directory?(path) rescue nil
+		end
+	end
+rescue StandardError
+end
+'''
+    stub_p.write_text(stext + addition, encoding="utf-8", newline="\n")
+    print(f"[patched] {stub_p} ({marker})")
+
+
+STDLIB_FILES = [
+    # pure-Ruby, no C-extension dependencies in Ruby 3.1
+    "set.rb", "ostruct.rb", "singleton.rb", "observer.rb", "forwardable.rb", "forwardable/impl.rb",
+    "delegate.rb", "weakref.rb", "English.rb", "abbrev.rb", "base64.rb", "shellwords.rb", "fileutils.rb",
+    "pp.rb", "prettyprint.rb", "tsort.rb", "find.rb", "benchmark.rb", "matrix.rb", "prime.rb",
+    "uri.rb", "uri/",
+]
+
+
+def patch_preload_compat_v2() -> None:
+    # Thread.critical, Windows '\' paths, To the Moon's Utils.dll AVSetEnv, rubygems stub, and a
+    # romfs:/stdlib fallback for `require` (see scripts/mkxpz/preload-compat-v2.rb).
+    src = (Path(__file__).resolve().parent / "mkxpz" / "preload-compat-v2.rb").read_text(encoding="utf-8")
+    stub_p = ROOT / "switch/romfs-root/preload/win32api_stub.rb"
+    stext = stub_p.read_text(encoding="utf-8")
+    marker = "# [switch2-preload-compat-v2]"
+    if marker in stext:
+        head, _, _ = stext.partition("\n" + marker)
+        stext = head
+    stub_p.write_text(stext + src, encoding="utf-8", newline="\n")
+    print(f"[patched] {stub_p} ({marker})")
+
+    libs = sorted(ROOT.glob("subprojects/ruby-*/lib"))
+    if not libs:
+        print("[warn] Ruby stdlib source not found; romfs:/stdlib fallback will be empty")
+        return
+    lib = libs[-1]
+    out = ROOT / "switch/romfs-root/stdlib"
+    copied = 0
+    for rel in STDLIB_FILES:
+        s = lib / rel
+        files = sorted(s.rglob("*.rb")) if rel.endswith("/") and s.is_dir() else ([s] if s.is_file() else [])
+        for f in files:
+            dst = out / f.relative_to(lib)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            write_if_changed(dst, f.read_text(encoding="utf-8"))
+            copied += 1
+    print(f"[ok] {copied} stdlib file(s) staged in romfs:/stdlib")
+
+
+def patch_skip_game_win32_wrap() -> None:
+    # Games that shipped for desktop mkxp bring their own (older) preload/win32_wrap.rb, e.g. the GOG release of
+    # To the Moon ("preloadScript=mkxp/preload/win32_wrap.rb" in mkxp.conf). Loading it after our RomFS copy
+    # re-runs its `alias update` on top of the Switch controls hook and Graphics.update then recurses forever
+    # (SystemStackError). Our RomFS win32_wrap.rb is a superset, so drop the game's copy.
+    patch_file(
+        "src/main.cpp",
+        "// [switch2-skip-game-win32-wrap]",
+        [
+            (
+                '        "romfs:/preload/perf_trace.rb",\n'
+                "    });\n"
+                "#endif\n",
+                '        "romfs:/preload/perf_trace.rb",\n'
+                "    });\n"
+                "    // [switch2-skip-game-win32-wrap]\n"
+                "    for (auto it = conf.preloadScripts.begin(); it != conf.preloadScripts.end();) {\n"
+                "        const std::string &s = *it;\n"
+                "        size_t sep = s.find_last_of(\"/\\\\\");\n"
+                "        std::string base = sep == std::string::npos ? s : s.substr(sep + 1);\n"
+                "        for (auto &ch : base) ch = (char)tolower((unsigned char)ch);\n"
+                "        if (s.rfind(\"romfs:\", 0) != 0 && base == \"win32_wrap.rb\") {\n"
+                "            Debug() << \"[preload] skipping game-provided\" << s << \"(built-in Switch win32_wrap.rb is used instead)\";\n"
+                "            it = conf.preloadScripts.erase(it);\n"
+                "        } else {\n"
+                "            ++it;\n"
+                "        }\n"
+                "    }\n"
+                "#endif\n",
+            ),
+        ],
+    )
+
+
+def patch_fs_uncached_dir_fallback() -> None:
+    # Directories that only exist inside an archive RTP (To the Moon: RTP=lang.dat, a ZIP holding
+    # lang/<code>/Graphics/...) can be missing from the Switch fast path cache. When the cache has no entry
+    # at all for a directory, ask PhysFS directly (original case) before reporting NoFileError.
+    patch_file(
+        "src/filesystem/filesystem.cpp",
+        "// [switch2-fs-uncached-dir-fallback]",
+        [
+            (
+                "  if (data.matchCount == 0) {\n"
+                "    if (p->havePathCache && !isSilentProbeFilename(filename)) {\n",
+                "  // [switch2-fs-uncached-dir-fallback]\n"
+                "  if (data.matchCount == 0 && p->havePathCache && p->fileLists[dir].empty()) {\n"
+                "    static std::vector<std::string> knownEmptyDirs;\n"
+                "    const size_t sl = filename_nm.find_last_of('/');\n"
+                "    const std::string odir = sl == std::string::npos ? std::string() : filename_nm.substr(0, sl);\n"
+                "    const std::string ofile = sl == std::string::npos ? filename_nm : filename_nm.substr(sl + 1);\n"
+                "    bool knownEmpty = false;\n"
+                "    for (const auto &d : knownEmptyDirs) if (d == odir) { knownEmpty = true; break; }\n"
+                "    if (!knownEmpty) {\n"
+                "      OpenReadEnumData d2(handler, ofile.c_str(), ofile.size(), 0);\n"
+                "      PHYSFS_enumerate(odir.c_str(), openReadEnumCB, &d2);\n"
+                "      if (d2.physfsError)\n"
+                "        throw Exception(Exception::PHYSFSError, \"PhysFS: %s\", d2.physfsError);\n"
+                "      if (d2.matchCount > 0)\n"
+                "        return;\n"
+                "      char **lst = PHYSFS_enumerateFiles(odir.c_str());\n"
+                "      const bool any = lst && lst[0];\n"
+                "      if (lst) PHYSFS_freeList(lst);\n"
+                "      if (!any && knownEmptyDirs.size() < 4096) knownEmptyDirs.push_back(odir);\n"
+                "    }\n"
+                "  }\n"
+                "  if (data.matchCount == 0) {\n"
+                "    if (p->havePathCache && !isSilentProbeFilename(filename)) {\n",
+            ),
+        ],
+    )
+
+
+def patch_switch_controls_guards() -> None:
+    # The Quick Menu's "safe to return to title?" check assumed Pokemon Essentials' Game_Temp#in_menu;
+    # plain RGSS1 games (To the Moon) don't have it -> NoMethodError when pressing "-".
+    patch_file(
+        "switch/romfs-root/preload/switch_controls.rb",
+        "# [switch2-quickmenu-gametemp-guards]",
+        [
+            (
+                "\t\treturn false if $game_temp.in_battle || $game_temp.in_menu ||\n"
+                "\t\t                $game_temp.message_window_showing\n",
+                "\t\t# [switch2-quickmenu-gametemp-guards]\n"
+                "\t\tt = $game_temp\n"
+                "\t\treturn false if (t.respond_to?(:in_battle) && t.in_battle) ||\n"
+                "\t\t                (t.respond_to?(:in_menu) && t.in_menu) ||\n"
+                "\t\t                (t.respond_to?(:message_window_showing) && t.message_window_showing)\n",
+            ),
+        ],
+    )
+
+
+def patch_rgss1_source_fixups() -> None:
+    # Deterministic Ruby 1.8 -> 3 fixups applied to RGSS1 script sections before they are evaluated.
+    # Pokemon Essentials' StringInput#getc returns `@string[@pos]`, a byte (Integer) in Ruby 1.8 but a
+    # 1-char String in Ruby 3, which breaks every binary reader built on it (fgetdw -> TypeError while
+    # loading Data/items.dat in Pokemon Uranium). String#getbyte is the exact Ruby 1.8 equivalent.
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss1-source-fixups]",
+        [
+            (
+                "            int state;\n"
+                "            \n"
+                "            evalString(string, fname, &state);\n",
+                "            int state;\n"
+                "            \n"
+                "            // [switch2-rgss1-source-fixups]\n"
+                "            if (rgssVer == 1) {\n"
+                "                std::string fx(RSTRING_PTR(string), RSTRING_LEN(string));\n"
+                "                const size_t cls = fx.find(\"class StringInput\");\n"
+                "                if (cls != std::string::npos) {\n"
+                "                    int n = 0;\n"
+                "                    for (size_t at = fx.find(\"@string[@pos]\", cls); at != std::string::npos;\n"
+                "                         at = fx.find(\"@string[@pos]\", at + 21)) {\n"
+                "                        fx.replace(at, 13, \"@string.getbyte(@pos)\");\n"
+                "                        ++n;\n"
+                "                    }\n"
+                "                    if (n > 0) {\n"
+                "                        Debug() << \"[rgss18]\" << buf << \": StringInput byte read fix x\" << n;\n"
+                "                        string = newStringUTF8(fx.c_str(), fx.size());\n"
+                "                        rb_ary_store(script, 3, string);\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "            evalString(string, fname, &state);\n",
+            ),
+        ],
+    )
+
+
+def patch_rgss1_source_fixups_v2() -> None:
+    # Essentials' FileInputMixin readers (fgetb/fgetw/fgetdw) assume each_byte yields Integers (Ruby 1.8).
+    # Convert a String byte with .ord right where it's used, and log once which getc produced it.
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss1-source-fixups-v2]",
+        [
+            (
+                "            evalString(string, fname, &state);\n",
+                "            // [switch2-rgss1-source-fixups-v2]\n"
+                "            if (rgssVer == 1) {\n"
+                "                std::string fx(RSTRING_PTR(string), RSTRING_LEN(string));\n"
+                "                if (fx.find(\"module FileInputMixin\") != std::string::npos) {\n"
+                "                    int n = 0;\n"
+                "                    const char *from[] = {\"ret|=(i<<x)\", \"ret=i || 0\"};\n"
+                "                    const char *to[] = {\"ret|=(SW2Diag.byte(self, i)<<x)\", \"ret=SW2Diag.byte(self, i) || 0\"};\n"
+                "                    for (int r = 0; r < 2; ++r) {\n"
+                "                        const size_t fl = strlen(from[r]);\n"
+                "                        for (size_t at = fx.find(from[r]); at != std::string::npos; at = fx.find(from[r], at + strlen(to[r]))) {\n"
+                "                            fx.replace(at, fl, to[r]);\n"
+                "                            ++n;\n"
+                "                        }\n"
+                "                    }\n"
+                "                    if (n > 0) {\n"
+                "                        Debug() << \"[rgss18]\" << buf << \": FileInputMixin byte read fix x\" << n;\n"
+                "                        string = newStringUTF8(fx.c_str(), fx.size());\n"
+                "                        rb_ary_store(script, 3, string);\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "            evalString(string, fname, &state);\n",
+            ),
+        ],
+    )
+
+
+def patch_rgss1_source_fixups_v3() -> None:
+    # More Ruby 1.8 byte-indexing idioms (str[i] was the byte value in 1.8, a 1-char String in Ruby 3):
+    #  * `x.read(1)[0]` - "read one byte" everywhere in XP-era code
+    #  * Pokemon Essentials' AudioUtilities MP3 header parser (getPlayTime2): rstr[0] / rstr[1]
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss1-source-fixups-v3]",
+        [
+            (
+                "            // [switch2-rgss1-source-fixups-v2]\n",
+                "            // [switch2-rgss1-source-fixups-v3]\n"
+                "            if (rgssVer == 1) {\n"
+                "                struct Fix { const char *trigger; const char *from; const char *to; };\n"
+                "                static const Fix fixes[] = {\n"
+                "                    {nullptr, \".read(1)[0]\", \".read(1).getbyte(0)\"},\n"
+                "                    {\"def getPlayTime2\", \"rstr[0]\", \"rstr.getbyte(0)\"},\n"
+                "                    {\"def getPlayTime2\", \"rstr[1]\", \"rstr.getbyte(1)\"},\n"
+                "                };\n"
+                "                std::string fx(RSTRING_PTR(string), RSTRING_LEN(string));\n"
+                "                int n = 0;\n"
+                "                for (const Fix &f : fixes) {\n"
+                "                    if (f.trigger && fx.find(f.trigger) == std::string::npos) continue;\n"
+                "                    const size_t fl = strlen(f.from), tl = strlen(f.to);\n"
+                "                    for (size_t at = fx.find(f.from); at != std::string::npos; at = fx.find(f.from, at + tl)) {\n"
+                "                        fx.replace(at, fl, f.to);\n"
+                "                        ++n;\n"
+                "                    }\n"
+                "                }\n"
+                "                if (n > 0) {\n"
+                "                    Debug() << \"[rgss18]\" << buf << \": byte index fix x\" << n;\n"
+                "                    string = newStringUTF8(fx.c_str(), fx.size());\n"
+                "                    rb_ary_store(script, 3, string);\n"
+                "                }\n"
+                "            }\n"
+                "            // [switch2-rgss1-source-fixups-v2]\n",
+            ),
+        ],
+    )
+
+
+def patch_font_win_metrics() -> None:
+    # The Pokemon "Power ..." pixel fonts (pkmnem.ttf etc., used by Pokemon Essentials games) store a
+    # POSITIVE hhea descender. FreeType/SDL_ttf derive the line height from hhea -> 14px at size 29, which
+    # cuts every glyph in half. Windows GDI (and thus RGSS on PC) uses the OS/2 usWin metrics instead, so
+    # do the same for fonts whose hhea metrics are clearly broken.
+    patch_file(
+        "src/display/font.cpp",
+        "// [switch2-font-win-metrics]",
+        [
+            (
+                "\t\tFT_Face face = TTF_FONT_TO_FT_FACE(font);\n",
+                "\t\tFT_Face face = TTF_FONT_TO_FT_FACE(font);\n"
+                "\t\t// [switch2-font-win-metrics]\n"
+                "\t\tif (face && face->descender > 0) {\n"
+                "\t\t\tTT_OS2 *os2 = (TT_OS2 *)FT_Get_Sfnt_Table(face, FT_SFNT_OS2);\n"
+                "\t\t\tif (os2 && os2->usWinAscent > 0) {\n"
+                "\t\t\t\tface->ascender = (FT_Short)os2->usWinAscent;\n"
+                "\t\t\t\tface->descender = (FT_Short)-(int)os2->usWinDescent;\n"
+                "\t\t\t\tface->height = (FT_Short)(face->ascender - face->descender);\n"
+                "\t\t\t}\n"
+                "\t\t}\n",
+            ),
+        ],
+    )
+
+
+def patch_resize_screen_recalc() -> None:
+    # Graphics.resize_screen relies on the window-resize event to recompute the output scale and offset.
+    # The Switch display never resizes, so the old ratio stayed (Pokemon Uranium: 512x384 drawn at the
+    # 640x480 scale, off-centre in the top-left). Recompute immediately on Switch.
+    patch_file(
+        "src/display/graphics.cpp",
+        "// [switch2-resize-screen-recalc]",
+        [
+            (
+                "    glState.scissorBox.set(IntRect(0, 0, p->scRes.x, p->scRes.y));\n"
+                "    \n"
+                "    shState->eThread().requestWindowResize(width, height);\n",
+                "    glState.scissorBox.set(IntRect(0, 0, p->scRes.x, p->scRes.y));\n"
+                "    \n"
+                "#ifdef __SWITCH__\n"
+                "    // [switch2-resize-screen-recalc]\n"
+                "    if (p->integerScaleActive && p->findHighestIntegerScale())\n"
+                "        p->rebuildIntegerScaleBuffer();\n"
+                "    glState.viewport.refresh();\n"
+                "    p->recalculateScreenSize(shState->config().fixedAspectRatio);\n"
+                "    p->updateScreenResoRatio(p->threadData);\n"
+                "#endif\n"
+                "    shState->eThread().requestWindowResize(width, height);\n",
+            ),
+        ],
+    )
+
+
+def patch_resize_screen_log() -> None:
+    # Logs the output geometry whenever the game resolution changes, to diagnose games drawn
+    # off-centre after Graphics.resize_screen (Pokemon Uranium, 512x384).
+    patch_file(
+        "src/display/graphics.cpp",
+        "// [switch2-resize-screen-log]",
+        [
+            (
+                "    p->checkResize();\n"
+                "    p->redrawScreen();\n"
+                "}\n",
+                "    p->checkResize();\n"
+                "    // [switch2-resize-screen-log]\n"
+                "    {\n"
+                "        static Vec2i loggedRes(-1, -1), loggedWin(-1, -1), loggedSize(-1, -1);\n"
+                "        TEXFBO &fb = p->screen.getPP().frontBuffer();\n"
+                "        if (!(loggedRes == p->scRes) || !(loggedWin == p->winSize) || !(loggedSize == p->scSize)) {\n"
+                "            loggedRes = p->scRes; loggedWin = p->winSize; loggedSize = p->scSize;\n"
+                "            Debug() << \"[screen] res\" << p->scRes.x << \"x\" << p->scRes.y\n"
+                "                    << \"win\" << p->winSize.x << \"x\" << p->winSize.y\n"
+                "                    << \"out\" << p->scSize.x << \"x\" << p->scSize.y\n"
+                "                    << \"at\" << p->scOffset.x << \",\" << p->scOffset.y\n"
+                "                    << \"fb\" << fb.width << \"x\" << fb.height\n"
+                "                    << \"int\" << p->integerScaleActive << \"fixed\" << shState->config().fixedAspectRatio;\n"
+                "        }\n"
+                "    }\n"
+                "    p->redrawScreen();\n"
+                "}\n",
+            ),
+            (
+                "void Graphics::resizeScreen(int width, int height) {\n",
+                "void Graphics::resizeScreen(int width, int height) {\n"
+                "    Debug() << \"[screen] resize_screen\" << width << height;\n",
+            ),
+        ],
+    )
+    # v2: the loading screen resizes to 1280x720 for every frame it draws; keep the log short.
+    patch_file(
+        "src/display/graphics.cpp",
+        "// [switch2-resize-screen-log-v2]",
+        [
+            (
+                "        static Vec2i loggedRes(-1, -1), loggedWin(-1, -1), loggedSize(-1, -1);\n"
+                "        TEXFBO &fb = p->screen.getPP().frontBuffer();\n"
+                "        if (!(loggedRes == p->scRes) || !(loggedWin == p->winSize) || !(loggedSize == p->scSize)) {\n",
+                "        // [switch2-resize-screen-log-v2]\n"
+                "        static Vec2i loggedRes(-1, -1), loggedWin(-1, -1), loggedSize(-1, -1);\n"
+                "        static int loggedCount = 0;\n"
+                "        TEXFBO &fb = p->screen.getPP().frontBuffer();\n"
+                "        if (loggedCount < 8 && (!(loggedRes == p->scRes) || !(loggedWin == p->winSize) || !(loggedSize == p->scSize))) {\n"
+                "            ++loggedCount;\n",
+            ),
+            (
+                "    Debug() << \"[screen] resize_screen\" << width << height;\n",
+                "",
+            ),
+        ],
+    )
+
+
+def patch_essentials_xp_resolution() -> None:
+    # Pokemon Essentials XP games (Pokemon Uranium) declare DEFAULTSCREENWIDTH/HEIGHT (512x384) and relied on
+    # a patched RGSS player for that window size; RGSS1 has no resize_screen. Right after the script that
+    # declares the size, let SW2EssentialsResolution (win32_wrap.rb) resize the screen. Done from the script
+    # loop because Switch preloads (fast_forward.rb) replace Graphics.update.
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-essentials-resolution]",
+        [
+            (
+                "            if (state) {\n"
+                "                VALUE err = rb_errinfo();\n"
+                "                if (!NIL_P(err) && rb_obj_is_kind_of(err, rb_eSyntaxError)) {\n"
+                "                    VALUE emsg",
+                "            // [switch2-essentials-resolution]\n"
+                "            if (!state && rgssVer == 1) {\n"
+                "                static bool sw2ResDone = false;\n"
+                "                if (!sw2ResDone && rb_const_defined(rb_cObject, rb_intern(\"DEFAULTSCREENWIDTH\")) &&\n"
+                "                    rb_const_defined(rb_cObject, rb_intern(\"DEFAULTSCREENHEIGHT\"))) {\n"
+                "                    sw2ResDone = true;\n"
+                "                    int resState = 0;\n"
+                "                    rb_eval_string_protect(\"if defined?(SW2EssentialsResolution) then SW2EssentialsResolution.check \"\n"
+                "                                           \"else System.puts('[screen] SW2EssentialsResolution missing') end\", &resState);\n"
+                "                    if (resState) {\n"
+                "                        Debug() << \"[screen] resolution check raised after\" << buf;\n"
+                "                        rb_set_errinfo(Qnil);\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "            if (state) {\n"
+                "                VALUE err = rb_errinfo();\n"
+                "                if (!NIL_P(err) && rb_obj_is_kind_of(err, rb_eSyntaxError)) {\n"
+                "                    VALUE emsg",
+            ),
+        ],
+    )
+
+
+def patch_loading_screen_progress() -> None:
+    # MV/MZ-style loading screen for mkxp-z games: the preload draws it, and the script loader advances
+    # its progress bar before each game script (throttled in Ruby to a few frames per second).
+    src = (Path(__file__).resolve().parent / "mkxpz" / "loading-screen.rb").read_text(encoding="utf-8")
+    write_if_changed(ROOT / "switch/romfs-root/preload/loading_screen.rb", src)
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-loading-progress]",
+        [
+            (
+                "            int state;\n"
+                "            \n"
+                "            // [switch2-rgss1-source-fixups]\n",
+                "            int state;\n"
+                "            \n"
+                "            // [switch2-loading-progress]\n"
+                "            {\n"
+                "                static bool sw2LoadDone = false;\n"
+                "                if (!sw2LoadDone) {\n"
+                "                    if (i >= scriptCount - 1)\n"
+                "                        sw2LoadDone = true;\n"
+                "                    rb_gv_set(\"$__sw2_script_name\", rb_str_new_cstr(scriptName));\n"
+                "                    char call[192];\n"
+                "                    snprintf(call, sizeof(call),\n"
+                "                             \"SW2Loading.step(%ld, %ld, $__sw2_script_name, %d) if defined?(SW2Loading)\",\n"
+                "                             i, scriptCount, rgssVer);\n"
+                "                    int loadState = 0;\n"
+                "                    rb_eval_string_protect(call, &loadState);\n"
+                "                    if (loadState)\n"
+                "                        rb_set_errinfo(Qnil);\n"
+                "                    rb_gv_set(\"$__sw2_script_name\", Qnil);\n"
+                "                }\n"
+                "            }\n"
+                "            // [switch2-rgss1-source-fixups]\n",
+            ),
+        ],
+    )
+
+
+def patch_rgss1_source_fixups_v4() -> None:
+    # Drop the Ruby 1.8 /n flag from regexps without byte escapes in RGSS1 scripts: in Ruby 3 a /n regexp
+    # that contains (or interpolates) non-ASCII characters raises RegexpError at runtime (Pokemon Uranium
+    # DrawText: /(?:...#{CJKUtils::WordRegexp::WordRegexp}...)/n). For ASCII-only patterns /n is a no-op.
+    patch_file(
+        "binding/binding-mri.cpp",
+        "// [switch2-rgss1-source-fixups-v4]",
+        [
+            (
+                "            // [switch2-rgss1-source-fixups-v3]\n",
+                "            // [switch2-rgss1-source-fixups-v4]\n"
+                "            if (rgssVer == 1) {\n"
+                "                std::string fx(RSTRING_PTR(string), RSTRING_LEN(string));\n"
+                "                if (fx.find(\"/n\") != std::string::npos) {\n"
+                "                    int nFixes = 0;\n"
+                "                    std::string out = switch2_rgss18::stripRegexN(fx, &nFixes);\n"
+                "                    if (nFixes > 0) {\n"
+                "                        Debug() << \"[rgss18]\" << buf << \": dropped /n from\" << nFixes << \"regexp(s)\";\n"
+                "                        string = newStringUTF8(out.c_str(), out.size());\n"
+                "                        rb_ary_store(script, 3, string);\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n"
+                "            // [switch2-rgss1-source-fixups-v3]\n",
+            ),
+        ],
+    )
+
+
+def patch_switch_controls_keyboard() -> None:
+    # Quick Menu "Open Keyboard": the Switch software keyboard is shown when a game switches text input on;
+    # if it's dismissed while the game still waits for text (Pokemon Reborn's name entry), there was no way
+    # to bring it back. Shown only while text input is active.
+    patch_file(
+        "switch/romfs-root/preload/switch_controls.rb",
+        "# [switch2-quickmenu-keyboard]",
+        [
+            (
+                "\t\t\titems << [:launcher, \"Return to Game Select\"]\n",
+                "\t\t\titems << [:keyboard, \"Open Keyboard\"] if SwitchControls.text_input_active? # [switch2-quickmenu-keyboard]\n"
+                "\t\t\titems << [:launcher, \"Return to Game Select\"]\n",
+            ),
+            (
+                "\t\telsif action == :launcher\n",
+                "\t\telsif action == :keyboard\n"
+                "\t\t\tSwitchControls.reopen_keyboard\n"
+                "\t\telsif action == :launcher\n",
+            ),
+        ],
+    )
+
+
+def patch_win32_hooks() -> None:
+    # Hooks for native DLLs whose names aren't valid Ruby constants (RGSS Linker / RGSS FmodEx) must be
+    # installed after Win32API exists, so they go at the end of the wrapper preload.
+    src = (Path(__file__).resolve().parent / "mkxpz" / "win32-hooks.rb").read_text(encoding="utf-8")
+    wrap_p = ROOT / "scripts/preload/win32_wrap.rb"
+    text = wrap_p.read_text(encoding="utf-8")
+    marker = "# [switch2-win32-hooks-v1]"
+    if marker in text:
+        text = text.partition("\n" + marker)[0]
+    write_if_changed(wrap_p, text.rstrip("\n") + "\n" + src)
+
+
 def write_if_changed(p: Path, content: str, mode: int | None = None) -> None:
     if p.exists() and p.read_text(encoding="utf-8") == content:
         print(f"[ok] {p} unchanged")
@@ -2617,5 +3334,24 @@ if __name__ == "__main__":
     patch_ruby_stdlib_and_discord()
     patch_legacy_conf_and_autodetect_ini()
     patch_binding_mri_syntax()
+    patch_binding_rgss18_retry()
+    patch_binding_rgss18_retry_v3()
+    patch_binding_runtime_error_context()
+    patch_preload_stdlib_env_shims()
+    patch_preload_compat_v2()
+    patch_win32_hooks()
+    patch_skip_game_win32_wrap()
+    patch_fs_uncached_dir_fallback()
+    patch_switch_controls_guards()
+    patch_rgss1_source_fixups()
+    patch_rgss1_source_fixups_v2()
+    patch_rgss1_source_fixups_v3()
+    patch_rgss1_source_fixups_v4()
+    patch_font_win_metrics()
+    patch_resize_screen_recalc()
+    patch_resize_screen_log()
+    patch_essentials_xp_resolution()
+    patch_loading_screen_progress()
+    patch_switch_controls_keyboard()
     write_switch2_cross_files()
     print("[done] mkxp-z Switch 2 patches applied cleanly")

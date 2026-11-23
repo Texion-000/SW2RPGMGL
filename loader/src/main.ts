@@ -314,6 +314,7 @@ async function launchGame(
   const input = createInputBridge();
   installMvCompat(runtime, host, {
     audioSupport,
+    fastMenu: game.config.fastMenu !== false,
     onFatalError: (errTitle, errDetail) => {
       showFatal(errTitle, errDetail);
     },

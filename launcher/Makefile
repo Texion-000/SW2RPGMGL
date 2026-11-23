@@ -14,7 +14,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 
 APP_TITLE   := SW2RPGMGL
 APP_AUTHOR  := Switch 2 RPG Maker Game Launcher
-APP_VERSION := 0.3.0
+APP_VERSION := 0.4.0
 APP_ICON    := ../loader/icon.jpg
 
 TARGET      := SW2RPGMGL

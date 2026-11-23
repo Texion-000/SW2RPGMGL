@@ -33,6 +33,8 @@ export interface AudioSupport {
 
 export interface MvCompatOptions {
   audioSupport?: AudioSupport;
+  /** Reuse $dataMap + Spriteset_Map when returning from pause-menu scenes (default true). */
+  fastMenu?: boolean;
   onFatalError?: (title: string, detail: string) => void;
 }
 
@@ -1329,6 +1331,17 @@ export function installMvCompat(
   if (BitmapClass && typeof BitmapClass.snap === 'function' && !BitmapClass.__drFastSnap) {
     BitmapClass.__drFastSnap = true;
     const origSnap = BitmapClass.snap;
+    // One persistent snapshot target per mode, re-rendered on every menu open: only the latest menu
+    // background is ever displayed, and allocating a fresh full-screen canvas / RenderTexture +
+    // framebuffer per snapshot was the bulk of the 70-230ms menu-open snapshot cost.
+    let snapCache: { mode: '2d' | 'rt'; w: number; h: number; bitmap: any; rt?: any } | null = null;
+    let snapLogCount = 0;
+    const snapLog = (msg: string) => {
+      if (snapLogCount < 8) {
+        snapLogCount++;
+        log(`[snap] ${msg}`);
+      }
+    };
     BitmapClass.snap = function (stage: any) {
       const gw = Graphics?.width || 816;
       const gh = Graphics?.height || 624;
@@ -1340,19 +1353,83 @@ export function installMvCompat(
         const vp = host.getViewport?.();
         if (surf && vp && vp.w > 0 && vp.h > 0) {
           try {
-            const bitmap = new BitmapClass(gw, gh);
-            const ctx = bitmap._context;
-            if (ctx) {
-              ctx.drawImage(surf, vp.x, vp.y, vp.w, vp.h, 0, 0, gw, gh);
-              bitmap._setDirty?.();
-              return bitmap;
+            const t0 = performance.now();
+            let c = snapCache;
+            const reused = Boolean(
+              c && c.mode === '2d' && c.w === gw && c.h === gh && c.bitmap?._context && !c.bitmap._destroyed,
+            );
+            if (!reused) {
+              const bmp = new BitmapClass(gw, gh);
+              c = snapCache = bmp?._context ? { mode: '2d', w: gw, h: gh, bitmap: bmp } : null;
             }
-          } catch { /* fall through to origSnap */ }
+            const t1 = performance.now();
+            const ctx = c?.bitmap?._context;
+            if (c && ctx) {
+              ctx.save?.();
+              ctx.globalCompositeOperation = 'copy';
+              ctx.globalAlpha = 1;
+              ctx.drawImage(surf, vp.x, vp.y, vp.w, vp.h, 0, 0, gw, gh);
+              ctx.restore?.();
+              c.bitmap._setDirty?.();
+              snapLog(`2d screen copy: alloc=${(t1 - t0).toFixed(1)}ms copy=${(performance.now() - t1).toFixed(1)}ms reused=${reused}`);
+              return c.bitmap;
+            }
+          } catch (err) {
+            snapLog(`2d screen copy failed: ${String(err)}`);
+          }
         }
       }
       // WebGL2 mode: render into a half-resolution RenderTexture so gl.readPixels reads 4x fewer bytes
       // (cuts menu-open GPU pipeline stall dramatically while looking clean behind menus).
       if (isWebGLMode && stage && Graphics?._renderer && PIXI?.RenderTexture?.create) {
+        // Zero-readback path: render the scene into a GPU RenderTexture and let the background Bitmap
+        // sample it directly (no gl.readPixels pipeline stall, no canvas copy, no re-upload).
+        try {
+          const t0 = performance.now();
+          let c = snapCache;
+          const reused = Boolean(
+            c && c.mode === 'rt' && c.w === gw && c.h === gh && c.rt && !c.rt.baseTexture?.destroyed &&
+            c.bitmap && c.bitmap.baseTexture === c.rt.baseTexture,
+          );
+          if (!reused) {
+            const rt = PIXI.RenderTexture.create({ width: gw, height: gh });
+            const bitmap = new BitmapClass(gw, gh);
+            const base = rt.baseTexture;
+            const prevBase = bitmap._baseTexture;
+            // Some PixiJS v5 MV ports expose Bitmap#_baseTexture as a getter-only accessor, so plain
+            // assignment throws in strict mode: shadow both accessors with own properties instead.
+            try { bitmap._baseTexture = base; } catch { /* getter-only */ }
+            if (bitmap._baseTexture !== base) {
+              try {
+                Object.defineProperty(bitmap, '_baseTexture', { value: base, writable: true, configurable: true });
+              } catch { /* ignore */ }
+            }
+            if (bitmap.baseTexture !== base) {
+              try {
+                Object.defineProperty(bitmap, 'baseTexture', { get: () => base, configurable: true });
+              } catch { /* ignore */ }
+            }
+            if (bitmap.baseTexture === base) {
+              try { if (snapCache?.rt) snapCache.rt.destroy?.(true); } catch { /* ignore */ }
+              c = snapCache = { mode: 'rt', w: gw, h: gh, bitmap, rt };
+            } else {
+              try { bitmap._baseTexture = prevBase; } catch { /* ignore */ }
+              rt.destroy?.(true);
+              c = null;
+              snapLog('webgl zero-copy unavailable (Bitmap.baseTexture not overridable) -> readback path');
+            }
+          }
+          if (c && c.rt) {
+            const t1 = performance.now();
+            Graphics._renderer.render(stage, c.rt, true);
+            snapLog(
+              `webgl zero-copy: alloc=${(t1 - t0).toFixed(1)}ms render=${(performance.now() - t1).toFixed(1)}ms reused=${reused}`,
+            );
+            return c.bitmap;
+          }
+        } catch (err) {
+          snapLog(`webgl zero-copy failed: ${String(err)}`);
+        }
         try {
           const hw = Math.max(1, gw >> 1);
           const hh = Math.max(1, gh >> 1);
@@ -1378,6 +1455,81 @@ export function installMvCompat(
       }
       return origSnap.call(this, stage);
     };
+  }
+  // 6d00. Menu spritesets (e.g. MenuCommonEvent.js's Spriteset_Menu, created on every menu open) build
+  //       100 Sprite_Picture objects each time (~120-300ms). Sprite_Picture reads $gameScreen live, so the
+  //       container from the previous (now discarded) menu spriteset of the same class can be re-attached.
+  const SpritesetBaseP = runtime.Spriteset_Base?.prototype;
+  if (SpritesetBaseP && typeof SpritesetBaseP.createPictures === 'function' && !SpritesetBaseP.__drPicReuse) {
+    SpritesetBaseP.__drPicReuse = true;
+    const origCreatePictures = SpritesetBaseP.createPictures;
+    // Everything the (possibly plugin-extended) createPictures sets up is recorded on the first build:
+    // the own properties it assigned (e.g. extra picture layers added by a plugin override, which
+    // updatePosition/update then touch) and the children it attached. A reuse restores all of them.
+    type PicSnap = { props: Array<[string, any]>; kids: any[]; owner: any; max: number; counts: number[] };
+    const pictureCache = new Map<any, PicSnap>();
+    const isDisplayObj = (v: any) => Boolean(v && typeof v === 'object' && Array.isArray(v.children));
+    SpritesetBaseP.createPictures = function () {
+      const SM = runtime.Spriteset_Map;
+      const SB = runtime.Spriteset_Battle;
+      if ((SM && this instanceof SM) || (SB && this instanceof SB)) return origCreatePictures.apply(this, arguments);
+      const ctor = this.constructor;
+      const max = Number(runtime.$gameScreen?.maxPictures?.() ?? -1);
+      const snap = pictureCache.get(ctor);
+      const owner = snap?.owner;
+      const ownerLive = Boolean(owner && owner !== this && owner.parent && owner.parent === SceneManager?._scene);
+      const intact = Boolean(
+        snap && snap.max === max && !ownerLive &&
+        snap.kids.every((k: any, i: number) => !k._destroyed && Array.isArray(k.children) && k.children.length === snap.counts[i]),
+      );
+      if (snap && intact) {
+        for (const [key, value] of snap.props) this[key] = value;
+        for (const k of snap.kids) {
+          try { k.parent?.removeChild?.(k); } catch { /* ignore */ }
+          this.addChild(k);
+        }
+        snap.owner = this;
+        return;
+      }
+      const beforeKeys = new Set(Object.keys(this));
+      const beforeKids = new Set(Array.isArray(this.children) ? this.children : []);
+      const res = origCreatePictures.apply(this, arguments);
+      try {
+        const props: Array<[string, any]> = [];
+        for (const key of Object.keys(this)) {
+          if (!beforeKeys.has(key)) props.push([key, this[key]]);
+        }
+        const kids = (Array.isArray(this.children) ? this.children : []).filter((c: any) => !beforeKids.has(c));
+        // Only cache when every new child is a display object we can move, and the picture
+        // container is among them (otherwise the override does something we don't understand).
+        if (kids.length > 0 && kids.every(isDisplayObj) && kids.includes(this._pictureContainer)) {
+          pictureCache.set(ctor, { props, kids, owner: this, max, counts: kids.map((k: any) => k.children.length) });
+        } else {
+          pictureCache.delete(ctor);
+        }
+      } catch {
+        pictureCache.delete(ctor);
+      }
+      return res;
+    };
+  }
+
+  // 6d0b. Fast JsonEx (saves / loads / makeDeepCopy). Stock MV writes '@'/'@c' metadata onto the LIVE game
+  //       objects while saving and `delete`s it afterwards, and on load it calls Object.setPrototypeOf on
+  //       every parsed object. In jitless V8 both leave objects in slow dictionary / prototype-mutated
+  //       mode: property access on loaded Game_Event objects measured ~6x slower, which is why the first
+  //       map after loading a save ran ~2x slower until the next map change rebuilt the events.
+  //       This encoder builds the identical JSON from a parallel structure, and the decoder creates
+  //       fresh objects with the right prototype.
+  installFastJsonEx();
+
+  // 6d0. Larger MV ImageCache: the stock 10-megapixel budget is exceeded by a single big map's tilesets +
+  //      characters + faces, so opening the menu evicted map images and closing it re-read and re-decoded
+  //      them from SD. 40 MP (~160 MB RGBA) fits comfortably in the Switch 2 application memory budget.
+  const ImageCacheClass = runtime.ImageCache;
+  if (ImageCacheClass && typeof ImageCacheClass.limit === 'number' && ImageCacheClass.limit < 40 * 1000 * 1000) {
+    ImageCacheClass.limit = 40 * 1000 * 1000;
+    log('[compat] ImageCache limit raised to 40 MP');
   }
   if (SceneManager?.snapForBackground) {
     SceneManager.snapForBackground = function () {
@@ -2081,6 +2233,53 @@ export function installMvCompat(
         return res;
       };
     }
+  }
+
+  // 6f2e. Defer window chrome (back / frame / cursor 9-slice bitmaps) for ALL windows until the window is
+  //       first drawn while open. Windows are constructed fully open (openness 255), so every
+  //       move()/padding/windowskin-load during construction rebuilt 3 canvases with ~20 blits even for
+  //       windows that are closed right after and may never open (e.g. 26 FTKR extra message windows +
+  //       their gold/choice/number/item sub-windows: ~2s on every Nightmare Knight map load).
+  if (
+    WindowProto && typeof WindowProto._refreshAllParts === 'function' &&
+    typeof WindowProto.updateTransform === 'function' && !WindowProto.__drLazyChrome
+  ) {
+    WindowProto.__drLazyChrome = true;
+    const innerAll = WindowProto._refreshAllParts;
+    const gate = (name: string) => {
+      const inner = WindowProto[name];
+      if (typeof inner !== 'function') return;
+      WindowProto[name] = function () {
+        if (!this.__drChromeLive) {
+          this.__drChromeDeferred = true;
+          return;
+        }
+        return inner.apply(this, arguments);
+      };
+    };
+    gate('_refreshAllParts');
+    gate('_refreshBack');
+    gate('_refreshFrame');
+    gate('_refreshCursor');
+    const goLive = (win: any) => {
+      win.__drChromeLive = true;
+      if (win.__drChromeDeferred) {
+        win.__drChromeDeferred = false;
+        innerAll.call(win);
+      }
+    };
+    const origWinUT = WindowProto.updateTransform;
+    WindowProto.updateTransform = function () {
+      if (!this.__drChromeLive) {
+        const op = typeof this._openness === 'number' ? this._openness : this.openness;
+        if (op > 0) goLive(this);
+      }
+      return origWinUT.apply(this, arguments);
+    };
+    // Anything that inspects the chrome sprites directly forces the real refresh first.
+    WindowProto.__drEnsureChrome = function () {
+      if (!this.__drChromeLive) goLive(this);
+    };
   }
 
   // 6f4. No-op setValue guard + dependency-indexed selective Game_Map.refresh()
@@ -3328,6 +3527,41 @@ export function installMvCompat(
   let mapCommonEvMs = 0;
   let mapScreenMs = 0;
   let mapSpritesetMs = 0;
+  // Spriteset breakdown (only sampled while profiling is active): characters, pictures, tilemap update,
+  // and tilemap repaint/transform during render.
+  let ssCharMs = 0;
+  let ssPicMs = 0;
+  let ssTmUpdMs = 0;
+  let ssTmXformMs = 0;
+  let ssTmXformFrames = 0;
+  const timeProto = (proto: any, key: string, add: (dt: number) => void) => {
+    const orig = proto?.[key];
+    if (typeof orig !== 'function' || orig.__drSsTime) return;
+    const w = function (this: any) {
+      if (!isProfActiveRef()) return orig.apply(this, arguments);
+      const s = performance.now();
+      try {
+        return orig.apply(this, arguments);
+      } finally {
+        add(performance.now() - s);
+      }
+    };
+    (w as any).__drSsTime = true;
+    proto[key] = w;
+  };
+  let isProfActiveRef: () => boolean = () => false;
+  timeProto(runtime.Sprite_Character?.prototype, 'update', (dt) => { ssCharMs += dt; });
+  timeProto(runtime.Sprite_Picture?.prototype, 'update', (dt) => { ssPicMs += dt; });
+  for (const tmName of ['Tilemap', 'ShaderTilemap']) {
+    const TmP = runtime[tmName]?.prototype;
+    if (!TmP || !Object.prototype.hasOwnProperty.call(TmP, 'update')) continue;
+    timeProto(TmP, 'update', (dt) => { ssTmUpdMs += dt; });
+  }
+  for (const tmName of ['Tilemap', 'ShaderTilemap']) {
+    const TmP = runtime[tmName]?.prototype;
+    if (!TmP || !Object.prototype.hasOwnProperty.call(TmP, 'updateTransform')) continue;
+    timeProto(TmP, 'updateTransform', (dt) => { ssTmXformMs += dt; ssTmXformFrames++; });
+  }
   let mapSpritesetTicks = 0;
   let mapWindowMs = 0;
   let mapTotalMs = 0;
@@ -3349,6 +3583,7 @@ export function installMvCompat(
   let hudFrameHistHead = 0;
 
   const isProfActive = () => perfLogCount < 24 || runtime.__drHudMode === 'pro';
+  isProfActiveRef = isProfActive;
 
   const GameMapProto = runtime.Game_Map?.prototype;
   if (GameMapProto?.update && !GameMapProto.__drProf) {
@@ -3491,6 +3726,574 @@ export function installMvCompat(
     };
   }
 
+  function installFastJsonEx(): void {
+    const J = runtime.JsonEx;
+    if (!J || J.__drFast || typeof J._encode !== 'function' || typeof J._decode !== 'function') return;
+    const encSrc = String(J._encode);
+    const decSrc = String(J._decode);
+    // Stock MV 1.6 encoder / decoder (no plugin wrapping them)?
+    const encStock = encSrc.includes("'@c'") && encSrc.includes('_generateId') &&
+      String(J.stringify).includes('_encode(') && String(J.stringify).includes('_restoreCircularReference');
+    const decStock = decSrc.includes('_resetPrototype') && decSrc.includes("'@a'") &&
+      String(J.parse).includes('_decode(JSON.parse(');
+    // A plugin may wrap _decode (e.g. a Spine plugin fixing Game_Spine objects after the stock decode):
+    // then keep the game's decode chain and only swap the slow Object.setPrototypeOf step.
+    const resetHook = !decStock && typeof J._resetPrototype === 'function' &&
+      typeof J._linkCircularReference === 'function';
+    if (!encStock && !decStock && !resetHook) {
+      const brief = (s: string) => s.replace(/\s+/g, ' ').slice(0, 220);
+      log('[compat] JsonEx differs from stock MV 1.6; keeping stock save/load code');
+      log(`[compat]   JsonEx._encode: ${brief(encSrc)}`);
+      log(`[compat]   JsonEx._decode: ${brief(decSrc)}`);
+      return;
+    }
+    J.__drFast = true;
+    const hasOwn = Object.prototype.hasOwnProperty;
+    const toStr = Object.prototype.toString;
+    const META = /^@./;
+    const FALLBACK = {};
+    const origStringify = J.stringify;
+    const origParse = J.parse;
+
+    if (encStock) J.stringify = function (object: any) {
+      try {
+        const ids = new Map<any, number>();
+        let nextId = 1;
+        const maxDepth = Number(J.maxDepth) || 100;
+        const enc = (value: any, depth: number): any => {
+          if (++depth >= maxDepth) throw new Error('Object too deep');
+          const type = toStr.call(value);
+          if (type !== '[object Object]' && type !== '[object Array]') return value;
+          if (typeof value.toJSON === 'function') throw FALLBACK;
+          const id = nextId++;
+          ids.set(value, id);
+          const isArr = type === '[object Array]';
+          const out: any = isArr ? new Array(value.length) : {};
+          for (const key in value) {
+            if (!hasOwn.call(value, key)) continue;
+            const v = value[key];
+            if (META.test(key)) { out[key] = v; continue; }
+            if (v && typeof v === 'object') {
+              const seen = ids.get(v);
+              if (seen) {
+                out[key] = { '@r': seen };
+              } else {
+                const e = enc(v, depth + 1);
+                if (Array.isArray(v)) {
+                  out[key] = { '@c': ids.get(v), '@a': e };
+                } else {
+                  out[key] = e;
+                }
+              }
+            } else {
+              out[key] = enc(v, depth + 1);
+            }
+          }
+          if (!isArr) {
+            out['@c'] = id;
+            const cname = J._getConstructorName(value);
+            if (cname !== 'Object' && cname !== 'Array') out['@'] = cname;
+          }
+          return out;
+        };
+        J._id = 1;
+        return JSON.stringify(enc(object, 0));
+      } catch (err) {
+        if (err === FALLBACK) return origStringify.call(this, object);
+        throw err;
+      }
+    };
+
+    if (decStock) J.parse = function (json: string) {
+      const circular: any[] = [];
+      const registry: Record<string, any> = {};
+      const dec = (value: any, regId?: any): any => {
+        const type = toStr.call(value);
+        if (type !== '[object Object]' && type !== '[object Array]') return value;
+        if (type === '[object Object]') {
+          let proto = Object.prototype;
+          const cname = value['@'];
+          if (cname) {
+            const ctor = runtime[cname];
+            if (typeof ctor === 'function' && ctor.prototype) proto = ctor.prototype;
+          }
+          const fresh = Object.create(proto);
+          for (const key in value) {
+            if (!hasOwn.call(value, key) || key === '@' || key === '@c') continue;
+            if (key in fresh) {
+              Object.defineProperty(fresh, key, { value: value[key], writable: true, enumerable: true, configurable: true });
+            } else {
+              fresh[key] = value[key];
+            }
+          }
+          registry[value['@c']] = fresh;
+          value = fresh;
+        } else if (regId !== undefined) {
+          registry[regId] = value;
+        }
+        for (const key in value) {
+          if (!hasOwn.call(value, key)) continue;
+          let v = value[key];
+          let wrapId: any;
+          if (v && v['@a']) {
+            wrapId = v['@c'];
+            v = v['@a'];
+            value[key] = v;
+          }
+          if (v && v['@r']) circular.push([key, value, v['@r']]);
+          value[key] = dec(v, wrapId);
+        }
+        return value;
+      };
+      try {
+        const contents = dec(JSON.parse(json));
+        for (const c of circular) c[1][c[0]] = registry[c[2]];
+        return contents;
+      } catch (err) {
+        log(`[compat] fast JsonEx.parse failed (${String(err)}); using stock parser`);
+        return origParse.call(this, json);
+      }
+    };
+    if (resetHook) {
+      // Object.create(proto) + copy instead of Object.setPrototypeOf (6x slower objects in jitless V8).
+      // The stock decoder registers each object for circular references *before* resetting its
+      // prototype, so remap the registry to the fresh copies before links are restored.
+      const fresher = new WeakMap<object, object>();
+      const origReset = J._resetPrototype;
+      J._resetPrototype = function (value: any, prototype: any) {
+        if (!value || typeof value !== 'object' || Array.isArray(value) || !prototype) {
+          return origReset.apply(this, arguments);
+        }
+        const fresh = Object.create(prototype);
+        for (const key in value) {
+          if (!hasOwn.call(value, key) || key === '@' || key === '@c') continue;
+          if (key in fresh) {
+            Object.defineProperty(fresh, key, { value: value[key], writable: true, enumerable: true, configurable: true });
+          } else {
+            fresh[key] = value[key];
+          }
+        }
+        fresher.set(value, fresh);
+        return fresh;
+      };
+      const origLink = J._linkCircularReference;
+      J._linkCircularReference = function (contents: any, circulars: any, registry: any) {
+        if (registry && typeof registry === 'object') {
+          for (const id in registry) {
+            const r = registry[id];
+            const f = r && typeof r === 'object' ? fresher.get(r) : undefined;
+            if (f) registry[id] = f;
+          }
+        }
+        return origLink.apply(this, arguments);
+      };
+    }
+    log(
+      `[compat] fast JsonEx enabled (save=${encStock ? 'fast' : 'stock'} ` +
+      `load=${decStock ? 'fast' : resetHook ? 'fast prototype reset (plugin-wrapped decode)' : 'stock'})`,
+    );
+  }
+
+  // 6j. Scene-transition profiler (menu open / map restore). Wraps scene create*/start methods, Window_*
+  //     constructors + refresh, Spriteset_Map builders and Bitmap drawing; it only measures while a
+  //     transition is in flight and logs the most expensive items for the first few transitions.
+  const transitionProf = {
+    active: false,
+    label: '',
+    t0: 0,
+    frames: 0,
+    items: new Map<string, { ms: number; n: number }>(),
+    logged: 0,
+    begin(label: string) {
+      if (this.logged >= 10) return;
+      this.active = true;
+      this.label = label;
+      this.t0 = performance.now();
+      this.frames = 0;
+      this.items.clear();
+    },
+    end() {
+      if (!this.active) return;
+      this.active = false;
+      this.logged++;
+      const total = performance.now() - this.t0;
+      const top = [...this.items.entries()]
+        .filter(([, v]) => v.ms >= 4)
+        .sort((a, b) => b[1].ms - a[1].ms)
+        .slice(0, 14)
+        .map(([k, v]) => `${k}=${v.ms.toFixed(0)}ms${v.n > 1 ? `x${v.n}` : ''}`);
+      log(`[prof] ${this.label}: total=${total.toFixed(0)}ms frames=${this.frames} | ${top.join(' ') || '(no item >= 4ms)'}`);
+    },
+  };
+  function installTransitionProfiler(): void {
+    const wrap = (obj: any, key: string, label: string) => {
+      let orig: any;
+      try { orig = obj[key]; } catch { return; }
+      if (typeof orig !== 'function' || orig.__drTp) return;
+      const w = function (this: any) {
+        if (!transitionProf.active) return orig.apply(this, arguments);
+        const s = performance.now();
+        try {
+          return orig.apply(this, arguments);
+        } finally {
+          const dt = performance.now() - s;
+          let it = transitionProf.items.get(label);
+          if (!it) transitionProf.items.set(label, (it = { ms: 0, n: 0 }));
+          it.ms += dt;
+          it.n++;
+        }
+      };
+      (w as any).__drTp = true;
+      try { obj[key] = w; } catch { /* ignore */ }
+    };
+    const ownFns = (proto: any): string[] => {
+      try {
+        return Object.getOwnPropertyNames(proto).filter((k) => {
+          if (k === 'constructor') return false;
+          const d = Object.getOwnPropertyDescriptor(proto, k);
+          return Boolean(d && typeof d.value === 'function' && d.writable);
+        });
+      } catch {
+        return [];
+      }
+    };
+    let n = 0;
+    for (const name of Object.getOwnPropertyNames(runtime)) {
+      let C: any;
+      try { C = runtime[name]; } catch { continue; }
+      if (typeof C !== 'function' || !C.prototype) continue;
+      const proto = C.prototype;
+      if (/^Scene_/.test(name)) {
+        for (const k of ownFns(proto)) {
+          if (/^(create|start|onMapLoaded|terminate|refresh|load|initialize)/.test(k)) {
+            wrap(proto, k, `${name}.${k}`);
+            n++;
+          }
+        }
+      } else if (/^Window_/.test(name)) {
+        for (const k of ['initialize', 'refresh', 'drawAllItems', 'drawItem', 'drawFace', 'drawActorFace']) {
+          if (Object.prototype.hasOwnProperty.call(proto, k)) {
+            wrap(proto, k, `${name}.${k}`);
+            n++;
+          }
+        }
+      } else if (/^Spriteset_/.test(name)) {
+        for (const k of ownFns(proto)) {
+          if (/^(create|initialize|load)/.test(k)) {
+            wrap(proto, k, `${name}.${k}`);
+            n++;
+          }
+        }
+      }
+    }
+    const BmpP = runtime.Bitmap?.prototype;
+    if (BmpP) {
+      for (const k of ['initialize', 'drawText', 'blt', 'fillRect', 'gradientFillRect', 'clear', 'resize']) {
+        wrap(BmpP, k, `Bitmap.${k}`);
+      }
+    }
+    const IM = runtime.ImageManager;
+    if (IM) {
+      for (const k of ['loadBitmap', 'loadNormalBitmap', 'reserveBitmap']) wrap(IM, k, `ImageManager.${k}`);
+    }
+    if (runtime.DataManager) wrap(runtime.DataManager, 'loadMapData', 'DataManager.loadMapData');
+    if (SceneManager) wrap(SceneManager, 'snapForBackground', 'SceneManager.snapForBackground');
+    if (typeof SceneManager?.renderScene === 'function') {
+      const origRender = SceneManager.renderScene;
+      SceneManager.renderScene = function () {
+        if (transitionProf.active) transitionProf.frames++;
+        return origRender.apply(this, arguments);
+      };
+    }
+    log(`[prof] transition profiler armed (${n} scene/window methods)`);
+  }
+
+  function installFastMenuRoundTrip(): void {
+    const SceneMapP = runtime.Scene_Map?.prototype;
+    const DM = runtime.DataManager;
+    if (options?.fastMenu === false) {
+      log('[fastmenu] disabled by mv-loader.json');
+      return;
+    }
+    if (!SceneMapP || !DM || typeof DM.loadMapData !== 'function' || SceneMapP.__drFastMenu) return;
+    if (typeof SceneMapP.create !== 'function' || typeof SceneMapP.terminate !== 'function') return;
+    SceneMapP.__drFastMenu = true;
+
+    type Trip = {
+      gameMap: any;
+      mapId: number;
+      tilesetId: number;
+      data: any;
+      spriteset: any;
+      baseline: Map<any, Set<any>> | null;
+      extras: Array<{ parent: any; child: any }>;
+    };
+    let trip: Trip | null = null;
+    let reuseData: Trip | null = null;
+    let logCount = 0;
+
+    // Spriteset reuse. With the stock Scene_Map.createSpriteset we simply re-attach the cached spriteset.
+    // When a plugin replaced createSpriteset (its override may store extra layers on the *scene*, so it
+    // must still run), we instead make the next `new Spriteset_Map()` inside it return the cached
+    // instance, by swapping the global constructor for a thin wrapper sharing the same prototype.
+    const csSrc = String(SceneMapP.createSpriteset || '').replace(/\s+/g, '');
+    const coreCreateSpriteset =
+      /^function(createSpriteset)?\(\)\{this\._spriteset=newSpriteset_Map\(\);?this\.addChild\(this\._spriteset\);?\}$/.test(csSrc);
+    let pendingSpriteset: any = null;
+    let ctorWrapped = false;
+    const OrigSpritesetMap = runtime.Spriteset_Map;
+    if (!coreCreateSpriteset && typeof OrigSpritesetMap === 'function' && !OrigSpritesetMap.__drFastMenuCtor) {
+      const Wrapped: any = function (this: any, ...args: any[]) {
+        const reuse = pendingSpriteset;
+        pendingSpriteset = null;
+        if (reuse) return reuse;
+        const obj = Reflect.construct(OrigSpritesetMap, args, new.target || Wrapped);
+        try { obj.__drBaseline = snapshotTree(obj); } catch { /* ignore */ }
+        return obj;
+      };
+      Wrapped.prototype = OrigSpritesetMap.prototype;
+      Object.setPrototypeOf(Wrapped, OrigSpritesetMap);  // inherit static members
+      try { Object.defineProperty(Wrapped, 'name', { value: OrigSpritesetMap.name || 'Spriteset_Map' }); } catch { /* ignore */ }
+      Wrapped.__drFastMenuCtor = true;
+      try {
+        runtime.Spriteset_Map = Wrapped;
+        ctorWrapped = runtime.Spriteset_Map === Wrapped;
+      } catch {
+        ctorWrapped = false;
+      }
+    }
+    const canReuseSpriteset =
+      (coreCreateSpriteset || ctorWrapped) && typeof SceneMapP.start === 'function' &&
+      typeof SceneMapP.createSpriteset === 'function';
+    log(
+      `[fastmenu] menu round-trip cache enabled (mapData=on spriteset=${
+        canReuseSpriteset ? (coreCreateSpriteset ? 'on' : 'on via Spriteset_Map hook') : 'off'
+      })`,
+    );
+
+    // Snapshot the spriteset's own children (2 levels) right after it was built, so children that
+    // scene-level plugin code attaches later (createDisplayObjects / onMapLoaded / start) can be told apart.
+    const snapshotTree = (root: any): Map<any, Set<any>> => {
+      const m = new Map<any, Set<any>>();
+      const walk = (node: any, depth: number) => {
+        if (!node || !Array.isArray(node.children)) return;
+        m.set(node, new Set(node.children));
+        if (depth < 1) for (let i = 0; i < node.children.length; i++) walk(node.children[i], depth + 1);
+      };
+      walk(root, 0);
+      return m;
+    };
+    const collectExtras = (
+      baseline: Map<any, Set<any>> | null,
+      exclude?: Array<{ parent: any; child: any }>,
+    ): Array<{ parent: any; child: any }> => {
+      const out: Array<{ parent: any; child: any }> = [];
+      if (!baseline) return out;
+      const ex = new Set((exclude || []).map((e) => e.child));
+      baseline.forEach((kids, parent) => {
+        const ch = parent?.children;
+        if (!Array.isArray(ch)) return;
+        for (let i = 0; i < ch.length; i++) {
+          const c = ch[i];
+          if (!kids.has(c) && !ex.has(c)) out.push({ parent, child: c });
+        }
+      });
+      return out;
+    };
+
+    const origLoadMapData = DM.loadMapData;
+    DM.loadMapData = function (mapId: number) {
+      const r = reuseData;
+      if (r && r.data && mapId === r.mapId) {
+        reuseData = null;
+        runtime.$dataMap = r.data;
+        return;
+      }
+      return origLoadMapData.apply(this, arguments);
+    };
+
+    const origCreate = SceneMapP.create;
+    SceneMapP.create = function () {
+      const t = trip;
+      trip = null;
+      const gm = runtime.$gameMap;
+      const ok = Boolean(
+        t &&
+        gm &&
+        t.gameMap === gm &&
+        !runtime.$gamePlayer?.isTransferring?.() &&
+        gm.mapId?.() === t.mapId &&
+        t.data,
+      );
+      this.__drTripT0 = performance.now();
+      this.__drTrip = ok ? t : null;
+      transitionProf.begin(ok ? 'map restore after menu' : 'map load');
+      reuseData = ok ? t : null;
+      try {
+        return origCreate.apply(this, arguments);
+      } finally {
+        reuseData = null;
+      }
+    };
+
+    if (canReuseSpriteset) {
+      const origCreateSpriteset = SceneMapP.createSpriteset;
+      SceneMapP.createSpriteset = function () {
+        const t: Trip | null = this.__drTrip;
+        const ss = t?.spriteset;
+        const ok = Boolean(
+          t &&
+          ss &&
+          !ss._destroyed &&
+          Array.isArray(ss.children) &&
+          !ss.parent &&
+          runtime.$gameMap?.tilesetId?.() === t.tilesetId,
+        );
+        if (ok && coreCreateSpriteset) {
+          this._spriteset = ss;
+          this.addChild(ss);
+          this.__drSpritesetReused = true;
+          return;
+        }
+        pendingSpriteset = ok ? ss : null;
+        try {
+          origCreateSpriteset.apply(this, arguments);
+        } finally {
+          pendingSpriteset = null;
+        }
+        const cur = this._spriteset;
+        this.__drSpritesetReused = Boolean(ok && cur === ss);
+        if (cur && !this.__drSpritesetReused && !cur.__drBaseline) {
+          try { cur.__drBaseline = snapshotTree(cur); } catch { /* ignore */ }
+        }
+        if (!this.__drSpritesetReused) this.__drBaseline = cur?.__drBaseline || null;
+      };
+    }
+
+    const origStart = SceneMapP.start;
+    if (typeof origStart === 'function') {
+      SceneMapP.start = function () {
+        const res = origStart.apply(this, arguments);
+        const t: Trip | null = this.__drTrip;
+        try {
+          if (this.__drSpritesetReused && t) {
+            this.__drBaseline = t.baseline || this._spriteset?.__drBaseline || null;
+            // Children attached by scene-level plugin code on the first build: if that code attached fresh
+            // ones again this time, the old ones are stale duplicates (no longer updated) -> remove them.
+            const fresh = collectExtras(this.__drBaseline, t.extras);
+            if (fresh.length > 0 && t.extras.length > 0) {
+              for (const e of t.extras) {
+                try { e.parent?.removeChild?.(e.child); } catch { /* ignore */ }
+              }
+              this.__drExtras = fresh;
+            } else {
+              this.__drExtras = t.extras.concat(fresh);
+            }
+          } else if (canReuseSpriteset) {
+            this.__drExtras = collectExtras(this.__drBaseline || null);
+          }
+        } catch { /* ignore */ }
+        transitionProf.end();
+        if (logCount < 12) {
+          logCount++;
+          const dt = performance.now() - (this.__drTripT0 || performance.now());
+          log(
+            `[fastmenu] Scene_Map ready in ${dt.toFixed(0)}ms ` +
+            `(mapData=${t ? 'reused' : 'loaded'} spriteset=${this.__drSpritesetReused ? 'reused' : 'built'})`,
+          );
+        }
+        this.__drTrip = null;
+        return res;
+      };
+    }
+
+    let menuOpenT0 = 0;
+    let menuTerminateMs = 0;
+    let menuSnapMs = 0;
+    let menuLogCount = 0;
+    if (typeof SceneManager?.snapForBackground === 'function') {
+      const origSnapFb = SceneManager.snapForBackground;
+      SceneManager.snapForBackground = function () {
+        const s0 = performance.now();
+        try {
+          return origSnapFb.apply(this, arguments);
+        } finally {
+          menuSnapMs = performance.now() - s0;
+        }
+      };
+    }
+    const MenuBaseP = runtime.Scene_MenuBase?.prototype;
+    if (MenuBaseP && typeof MenuBaseP.start === 'function') {
+      const origMenuStart = MenuBaseP.start;
+      MenuBaseP.start = function () {
+        const res = origMenuStart.apply(this, arguments);
+        if (transitionProf.active && transitionProf.label.startsWith('menu open')) transitionProf.end();
+        if (menuOpenT0 > 0 && menuLogCount < 12) {
+          menuLogCount++;
+          const dt = performance.now() - menuOpenT0;
+          log(
+            `[fastmenu] ${this.constructor?.name || 'menu'} ready in ${dt.toFixed(0)}ms ` +
+            `(map terminate=${menuTerminateMs.toFixed(0)}ms incl. snapshot=${menuSnapMs.toFixed(0)}ms, ` +
+            `menu create+load=${(dt - menuTerminateMs).toFixed(0)}ms)`,
+          );
+        }
+        menuOpenT0 = 0;
+        return res;
+      };
+    }
+
+    const origTerminate = SceneMapP.terminate;
+    SceneMapP.terminate = function () {
+      const nextScene = SceneManager?._nextScene;
+      const toMenu = Boolean(nextScene && isMenuLikeScene(nextScene));
+      const tt0 = performance.now();
+      menuSnapMs = 0;
+      if (toMenu) transitionProf.begin(`menu open (${nextScene?.constructor?.name || 'menu'})`);
+      const res = origTerminate.apply(this, arguments);
+      if (toMenu) {
+        menuOpenT0 = tt0;
+        menuTerminateMs = performance.now() - tt0;
+      }
+      try {
+        const next = SceneManager?._nextScene;
+        const gm = runtime.$gameMap;
+        if (next && isMenuLikeScene(next) && gm && runtime.$dataMap) {
+          const ss = this._spriteset;
+          const keepSs = canReuseSpriteset && ss && !ss._destroyed && Array.isArray(ss.children);
+          if (keepSs && ss.parent) {
+            try { ss.parent.removeChild(ss); } catch { /* ignore */ }
+          }
+          trip = {
+            gameMap: gm,
+            mapId: gm.mapId?.() ?? 0,
+            tilesetId: gm.tilesetId?.() ?? 0,
+            data: runtime.$dataMap,
+            spriteset: keepSs && !ss.parent ? ss : null,
+            baseline: this.__drBaseline || null,
+            extras: this.__drExtras || [],
+          };
+        } else {
+          trip = null;
+        }
+      } catch {
+        trip = null;
+      }
+      return res;
+    };
+
+    // Drop the cached map/spriteset as soon as a non-menu, non-map scene starts (title, battle, gameover...)
+    if (typeof SceneManager?.onSceneCreate === 'function') {
+      const origOnSceneCreate = SceneManager.onSceneCreate;
+      SceneManager.onSceneCreate = function () {
+        const sc = this._scene;
+        if (trip && sc && !isMenuLikeScene(sc) && !(runtime.Scene_Map && sc instanceof runtime.Scene_Map)) {
+          trip = null;
+        }
+        return origOnSceneCreate.apply(this, arguments);
+      };
+    }
+  }
+
   let lastAutoGcMs = 0;
   let lastSceneChangeMs = 0;
   const runAutoGc = (reason: string, mgr?: any) => {
@@ -3519,6 +4322,23 @@ export function installMvCompat(
     'Scene_Save',
     'Scene_GameEnd',
   ]);
+  // Any Scene_MenuBase subclass (custom quest/bestiary/shop/name scenes too) counts as a pause-menu scene.
+  const isMenuLikeScene = (scene: any): boolean => {
+    if (!scene) return false;
+    const MenuBase = runtime.Scene_MenuBase;
+    if (typeof MenuBase === 'function' && scene instanceof MenuBase) return true;
+    return MENU_SCENES.has(scene.constructor?.name || '');
+  };
+
+  // 6i. Fast pause-menu round-trips: when Scene_Map pushes a menu scene and the player returns without
+  //     transferring, stock MV re-reads + re-parses the map JSON from SD and rebuilds the whole
+  //     Spriteset_Map (tilemap, 100+ character sprites, pictures, lightmask bitmaps, ...). With V8 in
+  //     interpreter mode that costs hundreds of ms on big maps. Keep the parsed $dataMap and the
+  //     detached Spriteset_Map alive across the menu trip and re-attach them instead.
+  //     Opt out per game with `"fastMenu": false` in mv-loader.json.
+  installFastMenuRoundTrip();
+  installTransitionProfiler();
+
   if (SceneManager?.changeScene && !SceneManager.__drAutoGcHooked) {
     SceneManager.__drAutoGcHooked = true;
     const origChangeScene = SceneManager.changeScene;
@@ -3530,7 +4350,8 @@ export function installMvCompat(
         lastSceneChangeMs = now;
         const prevName = prevScene.constructor?.name || '?';
         const nextName = this._scene?.constructor?.name || '?';
-        const isMenuTransition = MENU_SCENES.has(prevName) || MENU_SCENES.has(nextName);
+        const isMenuTransition =
+          MENU_SCENES.has(prevName) || MENU_SCENES.has(nextName) || isMenuLikeScene(prevScene) || isMenuLikeScene(this._scene);
         if (!isMenuTransition && now - lastAutoGcMs >= 30000) {
           runAutoGc(`scene:${prevName}->${nextName}`, this);
         }
@@ -3539,6 +4360,9 @@ export function installMvCompat(
     };
   }
 
+  // Frames rendered while the Quick Menu overlay is open are not counted, so a 5 s perf window that
+  // contains overlay time reports a bogus low FPS; never trigger the low-FPS GC from such a window.
+  let overlaySeenInPerfWindow = false;
   if (SceneManager?.updateMain && !SceneManager.__drUpdateCap) {
     SceneManager.__drUpdateCap = true;
     const origUpdateMain = SceneManager.updateMain;
@@ -3548,6 +4372,7 @@ export function installMvCompat(
       }
       const newTime = this._getTimeInMsWithoutMobileSafari();
       if (runtime.__drOverlayOpen) {
+        overlaySeenInPerfWindow = true;
         this._currentTime = newTime;
         this._accumulator = 0;
         this._skipCount = 0;
@@ -3690,7 +4515,8 @@ export function installMvCompat(
             log(
               `[perf-map] tick=${(mapTotalMs / mt).toFixed(1)}ms ` +
               `(gameMap=${(mapGameMapMs / mt).toFixed(1)}ms[ref=${(mapRefreshMs / mt).toFixed(1)} ev=${(mapEventsMs / mt).toFixed(1)} ce=${(mapCommonEvMs / mt).toFixed(1)}] ` +
-              `spriteset=${(mapSpritesetMs / st).toFixed(1)}ms${lmSuffix} win=${(mapWindowMs / mt).toFixed(1)}ms) ` +
+              `spriteset=${(mapSpritesetMs / st).toFixed(1)}ms[ch=${(ssCharMs / st).toFixed(1)} pic=${(ssPicMs / st).toFixed(1)} tm=${(ssTmUpdMs / st).toFixed(1)}]${lmSuffix} ` +
+              `tmRender=${(ssTmXformMs / Math.max(1, n)).toFixed(1)}ms/f win=${(mapWindowMs / mt).toFixed(1)}ms) ` +
               `ticks/f=${(mt / n).toFixed(2)} ev=${evCount} ch=${chCount} fast=${fastPct}% pic=${picCount}`,
             );
           }
@@ -3701,6 +4527,7 @@ export function installMvCompat(
           fps < 42 &&
           sceneName === 'Scene_Map' &&
           !runtime.__drOverlayOpen &&
+          !overlaySeenInPerfWindow &&
           elapsed < 7500 &&
           now - lastSceneChangeMs >= 4500 &&
           now - lastAutoGcMs >= 25000
@@ -3710,6 +4537,7 @@ export function installMvCompat(
         perfFrames = 0;
         perfUpdateSum = 0;
         perfRenderSum = 0;
+        overlaySeenInPerfWindow = false;
         mapTicks = 0;
         mapGameMapMs = 0;
         mapRefreshMs = 0;
@@ -3717,6 +4545,11 @@ export function installMvCompat(
         mapCommonEvMs = 0;
         mapScreenMs = 0;
         mapSpritesetMs = 0;
+        ssCharMs = 0;
+        ssPicMs = 0;
+        ssTmUpdMs = 0;
+        ssTmXformMs = 0;
+        ssTmXformFrames = 0;
         mapSpritesetTicks = 0;
         mapWindowMs = 0;
         mapTotalMs = 0;

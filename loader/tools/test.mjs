@@ -1336,4 +1336,239 @@ class __MzTestClass { static ok() { const inner = 1; for (let i = 0; i < 2; i++)
   console.log('[PASS] path.posix/isAbsolute, nw.process, os.userInfo(), and index.html custom <canvas> pre-mounting');
 }
 
+// 24. Fast pause-menu round-trip: $dataMap + Spriteset_Map reused, stale scene-level extras deduped
+{
+  function Container() { this.children = []; this.parent = null; }
+  Container.prototype.addChild = function (c) { if (c.parent) c.parent.removeChild(c); this.children.push(c); c.parent = this; return c; };
+  Container.prototype.removeChild = function (c) { const i = this.children.indexOf(c); if (i >= 0) { this.children.splice(i, 1); c.parent = null; } return c; };
+  let builds = 0;
+  let loads = 0;
+  class Spriteset_Map extends Container {
+    constructor() { super(); builds++; this._tilemap = this.addChild(new Container()); }
+  }
+  function Scene_Base() { Container.call(this); }
+  Scene_Base.prototype = Object.create(Container.prototype);
+  function Scene_MenuBase() { Scene_Base.call(this); }
+  Scene_MenuBase.prototype = Object.create(Scene_Base.prototype);
+  function Scene_Menu() { Scene_MenuBase.call(this); }
+  Scene_Menu.prototype = Object.create(Scene_MenuBase.prototype);
+  function Scene_Title() { Scene_Base.call(this); }
+  Scene_Title.prototype = Object.create(Scene_Base.prototype);
+  function Scene_Map() { Scene_Base.call(this); }
+  Scene_Map.prototype = Object.create(Scene_Base.prototype);
+  const rt = {
+    Graphics: { width: 816, height: 624, frameCount: 0 },
+    Scene_MenuBase, Scene_Map, Scene_Menu, Scene_Title,
+    $gameMap: { mapId: () => 3, tilesetId: () => 1 },
+    $gamePlayer: { isTransferring: () => false },
+    $dataMap: null,
+    SceneManager: { _nextScene: null, onSceneCreate() {} },
+  };
+  rt.DataManager = { loadMapData(id) { loads++; rt.$dataMap = { id, data: [] }; } };
+  Scene_Map.prototype.create = function () { rt.DataManager.loadMapData(rt.$gameMap.mapId()); };
+  Scene_Map.prototype.createSpriteset = function () {
+    this._spriteset = new Spriteset_Map();
+    this.addChild(this._spriteset);
+  };
+  // Scene-level plugin code that attaches a HUD to the spriteset on every build
+  Scene_Map.prototype.start = function () {
+    this.createSpriteset();
+    this._hud = this._spriteset.addChild(new Container());
+  };
+  Scene_Map.prototype.terminate = function () { this.removeChild(this._spriteset); };
+  mod.installMvCompat(rt, { isDirectGpu: () => true, getWebGLContext: () => null }, {});
+
+  const s1 = new rt.Scene_Map();
+  s1.create(); s1.start();
+  assert.equal(builds, 1);
+  assert.equal(loads, 1);
+  const firstData = rt.$dataMap;
+  const firstSs = s1._spriteset;
+  rt.SceneManager._nextScene = new Scene_Menu();
+  s1.terminate();
+  rt.SceneManager._nextScene = null;
+
+  const s2 = new rt.Scene_Map();
+  s2.create(); s2.start();
+  assert.equal(loads, 1, 'map JSON must not be reloaded after a menu round-trip');
+  assert.equal(rt.$dataMap, firstData);
+  assert.equal(builds, 1, 'Spriteset_Map must be reused after a menu round-trip');
+  assert.equal(s2._spriteset, firstSs);
+  assert.equal(firstSs.parent, s2);
+  const huds = firstSs.children.filter((c) => c !== firstSs._tilemap);
+  assert.equal(huds.length, 1, 'stale scene-level HUD duplicate must be removed');
+  assert.equal(huds[0], s2._hud);
+
+  // A transfer (or new game / title) must rebuild everything
+  rt.SceneManager._nextScene = new Scene_Menu();
+  s2.terminate();
+  rt.SceneManager._nextScene = null;
+  rt.$gamePlayer.isTransferring = () => true;
+  const s3 = new rt.Scene_Map();
+  s3.create(); s3.start();
+  assert.equal(loads, 2);
+  assert.equal(builds, 2);
+  rt.$gamePlayer.isTransferring = () => false;
+
+  // Leaving to a non-menu scene does not cache
+  rt.SceneManager._nextScene = new Scene_Title();
+  s3.terminate();
+  const s4 = new rt.Scene_Map();
+  s4.create(); s4.start();
+  assert.equal(loads, 3);
+  assert.equal(builds, 3);
+
+  // "fastMenu": false opt-out keeps stock behaviour
+  const rtOff = { ...rt, Scene_Map: function Scene_Map() {}, DataManager: { loadMapData() {} } };
+  rtOff.Scene_Map.prototype = { create() {}, terminate() {}, start() {} };
+  mod.installMvCompat(rtOff, { isDirectGpu: () => true, getWebGLContext: () => null }, { fastMenu: false });
+  assert.equal(rtOff.Scene_Map.prototype.__drFastMenu, undefined);
+
+  // Plugin-overridden createSpriteset (stores its own layer on the scene): reuse via Spriteset_Map hook
+  let builds2 = 0;
+  function SS2() { Container.call(this); builds2++; this._tilemap = this.addChild(new Container()); }
+  SS2.prototype = Object.create(Container.prototype);
+  SS2.prototype.constructor = SS2;
+  SS2.prototype.update = function () {};
+  function SM2() { Scene_Base.call(this); }
+  SM2.prototype = Object.create(Scene_Base.prototype);
+  const rt2 = {
+    Graphics: { width: 816, height: 624, frameCount: 0 },
+    Scene_MenuBase, Scene_Menu, Scene_Title, Scene_Map: SM2, Spriteset_Map: SS2,
+    $gameMap: { mapId: () => 5, tilesetId: () => 2 },
+    $gamePlayer: { isTransferring: () => false },
+    $dataMap: null,
+    SceneManager: { _nextScene: null, onSceneCreate() {} },
+  };
+  let loads2 = 0;
+  rt2.DataManager = { loadMapData(id) { loads2++; rt2.$dataMap = { id }; } };
+  SM2.prototype.create = function () { rt2.DataManager.loadMapData(rt2.$gameMap.mapId()); };
+  // plugin override: builds via the global constructor, then stores an overlay on the scene
+  SM2.prototype.createSpriteset = function () {
+    this._spriteset = new rt2.Spriteset_Map();
+    this.addChild(this._spriteset);
+    this._pluginLayer = this._spriteset.addChild(new Container());
+  };
+  SM2.prototype.start = function () { this.createSpriteset(); };
+  SM2.prototype.terminate = function () { this.removeChild(this._spriteset); };
+  mod.installMvCompat(rt2, { isDirectGpu: () => true, getWebGLContext: () => null }, {});
+  assert.notEqual(rt2.Spriteset_Map, SS2, 'Spriteset_Map constructor is hooked');
+  const plain = new rt2.Spriteset_Map();
+  assert.ok(plain instanceof SS2 && plain instanceof rt2.Spriteset_Map);
+  const b0 = builds2;
+  const m1 = new SM2();
+  m1.create(); m1.start();
+  const ss1 = m1._spriteset;
+  rt2.SceneManager._nextScene = new Scene_Menu();
+  m1.terminate();
+  rt2.SceneManager._nextScene = null;
+  const m2 = new SM2();
+  m2.create(); m2.start();
+  assert.equal(loads2, 1);
+  assert.equal(builds2, b0 + 1, 'overridden createSpriteset still reuses the cached spriteset');
+  assert.equal(m2._spriteset, ss1);
+  assert.ok(m2._pluginLayer, 'plugin override still ran and set its scene field');
+  const layers = ss1.children.filter((c) => c !== ss1._tilemap);
+  assert.deepEqual(layers, [m2._pluginLayer], 'stale plugin layer from the first build was removed');
+
+  console.log('[PASS] Fast pause-menu round-trip ($dataMap + Spriteset_Map reuse, stale extras dedupe, transfer/title rebuild, opt-out, overridden createSpriteset)');
+}
+
+// 25. Lazy window chrome + menu spriteset picture container reuse
+{
+  let realRefreshes = 0;
+  function Window() { this._openness = 255; this._refreshAllParts(); this._refreshAllParts(); this._refreshBack(); }
+  Window.prototype._refreshAllParts = function () { realRefreshes++; };
+  Window.prototype._refreshBack = function () { realRefreshes++; };
+  Window.prototype._refreshFrame = function () { realRefreshes++; };
+  Window.prototype._refreshCursor = function () {};
+  Window.prototype.updateTransform = function () {};
+  let picBuilds = 0;
+  function Container() { this.children = []; this.parent = null; }
+  Container.prototype.addChild = function (c) { if (c.parent) c.parent.removeChild(c); this.children.push(c); c.parent = this; return c; };
+  Container.prototype.removeChild = function (c) { const i = this.children.indexOf(c); if (i >= 0) { this.children.splice(i, 1); c.parent = null; } return c; };
+  function Spriteset_Base() { Container.call(this); this.createPictures(); }
+  Spriteset_Base.prototype = Object.create(Container.prototype);
+  Spriteset_Base.prototype.createPictures = function () {
+    this._pictureContainer = new Container();
+    for (let i = 0; i < 100; i++) { picBuilds++; this._pictureContainer.addChild(new Container()); }
+    this.addChild(this._pictureContainer);
+  };
+  function Spriteset_Menu() { Spriteset_Base.call(this); }
+  Spriteset_Menu.prototype = Object.create(Spriteset_Base.prototype);
+  Spriteset_Menu.prototype.constructor = Spriteset_Menu;
+  function Spriteset_Map() { Spriteset_Base.call(this); }
+  Spriteset_Map.prototype = Object.create(Spriteset_Base.prototype);
+  Spriteset_Map.prototype.constructor = Spriteset_Map;
+  const rt = {
+    Graphics: { width: 816, height: 624, frameCount: 0 },
+    Window, Spriteset_Base, Spriteset_Map,
+    $gameScreen: { maxPictures: () => 100 },
+    SceneManager: { _scene: null },
+  };
+  mod.installMvCompat(rt, { isDirectGpu: () => true, getWebGLContext: () => null }, {});
+
+  const w = new rt.Window();
+  assert.equal(realRefreshes, 0, 'chrome refreshes are deferred during construction');
+  w._openness = 0;
+  w.updateTransform();
+  assert.equal(realRefreshes, 0, 'closed window stays deferred');
+  w._openness = 32;
+  w.updateTransform();
+  assert.equal(realRefreshes, 1, 'one real refresh when first drawn open');
+  w._refreshBack();
+  assert.equal(realRefreshes, 2, 'live windows refresh normally');
+
+  const scene1 = new Container();
+  rt.SceneManager._scene = scene1;
+  const m1 = scene1.addChild(new Spriteset_Menu());
+  assert.equal(picBuilds, 100);
+  const scene2 = new Container();
+  rt.SceneManager._scene = scene2;
+  const m2 = scene2.addChild(new Spriteset_Menu());
+  assert.equal(picBuilds, 100, 'menu spriteset reuses the previous picture container');
+  assert.equal(m2._pictureContainer, m1._pictureContainer);
+  assert.equal(m2._pictureContainer.parent, m2);
+  new Spriteset_Map();
+  assert.equal(picBuilds, 200, 'map spritesets always build their own pictures');
+
+  // Plugin override of createPictures that adds its own picture layer (Nightmare Knight crash:
+  // updatePosition touched that layer, which a reuse used to leave undefined)
+  function SB2() { Container.call(this); this.createPictures(); this.updatePosition(); }
+  SB2.prototype = Object.create(Container.prototype);
+  SB2.prototype.createPictures = function () {
+    this._pictureContainer = this.addChild(new Container());
+    for (let i = 0; i < 100; i++) { picBuilds++; this._pictureContainer.addChild(new Container()); }
+  };
+  const stockCreate = SB2.prototype.createPictures;
+  SB2.prototype.createPictures = function () {            // the plugin override
+    stockCreate.call(this);
+    this._upperPictures = this.addChild(new Container());
+    this._upperPictures.addChild(new Container());
+  };
+  SB2.prototype.updatePosition = function () { this._upperPictures.x = 1; };
+  function SMenu2() { SB2.call(this); }
+  SMenu2.prototype = Object.create(SB2.prototype);
+  SMenu2.prototype.constructor = SMenu2;
+  const rt3 = {
+    Graphics: { width: 816, height: 624, frameCount: 0 },
+    Spriteset_Base: SB2,
+    $gameScreen: { maxPictures: () => 100 },
+    SceneManager: { _scene: null },
+  };
+  mod.installMvCompat(rt3, { isDirectGpu: () => true, getWebGLContext: () => null }, {});
+  const before = picBuilds;
+  rt3.SceneManager._scene = new Container();
+  const a = rt3.SceneManager._scene.addChild(new SMenu2());
+  rt3.SceneManager._scene = new Container();
+  const b = rt3.SceneManager._scene.addChild(new SMenu2());   // used to throw in updatePosition
+  assert.equal(picBuilds, before + 100, 'second menu spriteset reused the pictures');
+  assert.equal(b._pictureContainer, a._pictureContainer);
+  assert.equal(b._upperPictures, a._upperPictures, 'plugin-created picture layer restored too');
+  assert.equal(b._upperPictures.parent, b);
+  assert.equal(b._upperPictures.x, 1);
+
+  console.log('[PASS] Lazy window chrome + menu spriteset picture container reuse');
+}
+
 console.log('\nALL UNIVERSAL SW2RPGMGL TESTS PASSED!');

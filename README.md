@@ -138,9 +138,11 @@ sdmc:/
     "skipPlugins": ["SomeBrokenPCPlugin.js"],
     "audioFormat": "auto",
     "displayMode": "fit",
-    "filterMode": "auto"
+    "filterMode": "auto",
+    "fastMenu": true
   }
   ```
+  `fastMenu` (MV, default `true`) keeps the map data and map sprites alive while a pause menu is open, so closing the menu doesn't reload the map. Set it to `false` if a plugin misbehaves after closing the menu.
 - **FTP-Safe ASCII Helper (`make-ftp-safe.bat` / `scripts/make-ftp-safe.py`):**
   Some Switch FTP servers (`ftpd`) fail to transfer files with Japanese/non-ASCII filenames. Copying directly to the SD card on PC avoids this, or if you use FTP *(requires **Python 3** installed and on your `PATH`)*:
   1. Upload your original game folder to `sdmc:/switch/SW2RPGMGL/games/<Game>/` via FTP (skipping any non-ASCII files that fail).

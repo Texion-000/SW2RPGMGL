@@ -27,6 +27,8 @@ export interface GameConfig {
   audioFormat?: 'auto' | 'ogg' | 'm4a';
   displayMode?: DisplayMode;
   filterMode?: FilterMode;
+  /** MV: reuse map data + Spriteset_Map across pause-menu round-trips (default true). */
+  fastMenu?: boolean;
 }
 
 export interface GameEntry {
@@ -213,6 +215,9 @@ function parseGameConfig(
       parsed.filterMode === 'bicubic'
     ) {
       cfg.filterMode = parsed.filterMode;
+    }
+    if (typeof parsed.fastMenu === 'boolean') {
+      cfg.fastMenu = parsed.fastMenu;
     }
     return cfg;
   } catch (err) {

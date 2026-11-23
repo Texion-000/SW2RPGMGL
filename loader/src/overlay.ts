@@ -90,8 +90,10 @@ export function createOverlay(
     return {
       engine: 'MV',
       backend: isGl ? 'WebGL2' : (host.isDirectGpu() ? '2D GPU' : '2D'),
-      fps: st?.fps ?? fpsDisplay,
-      frameMs: st?.frameMs ?? (fpsDisplay > 0 ? 1000 / fpsDisplay : 16.7),
+      // __drPerfStats is only refreshed while the Pro HUD is active; Basic must use the live counter or it
+      // shows the last Pro value frozen after switching Pro -> Basic.
+      fps: hudMode === 'pro' ? (st?.fps ?? fpsDisplay) : fpsDisplay,
+      frameMs: hudMode === 'pro' && st?.frameMs ? st.frameMs : (fpsDisplay > 0 ? 1000 / fpsDisplay : 16.7),
       updateMs: st?.updateMs,
       renderMs: st?.renderMs,
       ticksPerFrame: st?.ticksPerFrame,
@@ -113,6 +115,46 @@ export function createOverlay(
   function drawHud(ctx: any) {
     if (hudMode === 'off') return;
     drawPerfHud(ctx, hudMode, buildHudSnapshot());
+  }
+
+  // The HUD only occupies the top-left corner, so it is rasterized into a small cached canvas that is
+  // redrawn only when its content changes (Pro: every 250ms, Basic: when the FPS number changes).
+  // Previously the 2D path re-rasterized all HUD text every frame and the WebGL path re-uploaded a
+  // full game-resolution (e.g. 1024x768) canvas 4x/sec, which cost 10-30 FPS while the HUD was visible.
+  const HUD_MAX_W = 640;
+  const HUD_MAX_H = 176;
+  let hudCanvas: any = null;
+  let hudCtx: any = null;
+  let hudKey = '';
+
+  function hudContentKey(): string {
+    if (hudMode === 'pro') {
+      const now = performance.now();
+      if (now - lastProHudDrawMs >= 250) {
+        lastProHudDrawMs = now;
+        proHudTick++;
+      }
+      return `pro|${proHudTick}|${host.getDisplayMode()}`;
+    }
+    return `basic|${fpsDisplay}|${host.getDisplayMode()}`;
+  }
+
+  /** Returns the cached HUD canvas, redrawing it only when its content key changed. */
+  function renderHudCached(maxW: number): { canvas: any; changed: boolean } | null {
+    if (hudMode === 'off' || typeof OffscreenCanvas === 'undefined') return null;
+    const w = Math.max(64, Math.min(HUD_MAX_W, maxW | 0));
+    if (!hudCanvas || hudCanvas.width !== w) {
+      hudCanvas = new OffscreenCanvas(w, HUD_MAX_H);
+      hudCtx = hudCanvas.getContext('2d');
+      hudKey = '';
+    }
+    if (!hudCtx) return null;
+    const key = hudContentKey();
+    if (key === hudKey) return { canvas: hudCanvas, changed: false };
+    hudKey = key;
+    hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+    drawHud(hudCtx);
+    return { canvas: hudCanvas, changed: true };
   }
 
   function setOpen(next: boolean) {
@@ -237,6 +279,26 @@ export function createOverlay(
   let glContainer: any = null;
   let lastGlKey = '';
 
+  let hudGlTex: any = null;
+  let hudGlContainer: any = null;
+  let hudGlSource: any = null;
+
+  function ensureGlHudLayer(source: any): boolean {
+    const PIXI = (globalThis as any).PIXI;
+    if (!PIXI || !source) return false;
+    if (hudGlSource !== source || !hudGlTex || !hudGlContainer) {
+      const isPixiV5Plus = /^([5-9]|\d{2,})\./.test(String(PIXI.VERSION ?? ''));
+      hudGlTex = !isPixiV5Plus && typeof PIXI.Texture?.fromCanvas === 'function'
+        ? PIXI.Texture.fromCanvas(source)
+        : PIXI.Texture.from(source);
+      const spr = new PIXI.Sprite(hudGlTex);
+      hudGlContainer = new PIXI.Container();
+      hudGlContainer.addChild(spr);
+      hudGlSource = source;
+    }
+    return true;
+  }
+
   function ensureGlOverlay(gw: number, gh: number): boolean {
     const PIXI = (globalThis as any).PIXI;
     if (!PIXI) return false;
@@ -288,8 +350,21 @@ export function createOverlay(
       }
 
       if (ctx) {
-        if (open) drawMenu(ctx);
-        else drawHud(ctx);
+        if (open) {
+          drawMenu(ctx);
+        } else if (hudMode !== 'off') {
+          const cached = renderHudCached(ctx.canvas?.width || 1280);
+          if (cached) {
+            ctx.save();
+            if (typeof ctx.setTransform === 'function') ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.globalAlpha = 1;
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.drawImage(cached.canvas, 0, 0);
+            ctx.restore();
+          } else {
+            drawHud(ctx);
+          }
+        }
         return;
       }
 
@@ -303,25 +378,25 @@ export function createOverlay(
       if (!renderer) return;
       const gw = Graphics?.width || 816;
       const gh = Graphics?.height || 624;
-      if (!ensureGlOverlay(gw, gh)) return;
 
-      if (!open && hudMode === 'pro') {
-        const now = performance.now();
-        if (now - lastProHudDrawMs >= 250) {
-          lastProHudDrawMs = now;
-          proHudTick++;
-        }
+      if (!open) {
+        // HUD only: small cached texture, re-uploaded only when its content changes
+        lastGlKey = '';
+        const cached = renderHudCached(gw);
+        if (!cached || !ensureGlHudLayer(cached.canvas)) return;
+        if (cached.changed) hudGlTex.baseTexture?.update?.();
+        try {
+          renderer.render(hudGlContainer, undefined, false);
+        } catch { /* ignore */ }
+        return;
       }
-      const key = open
-        ? `menu|${selected}|${host.getDisplayMode()}|${host.getFilterMode()}|${hudMode}`
-        : hudMode === 'pro'
-          ? `pro|${proHudTick}|${host.getDisplayMode()}`
-          : `basic|${fpsDisplay}|${host.getDisplayMode()}`;
+
+      if (!ensureGlOverlay(gw, gh)) return;
+      const key = `menu|${selected}|${host.getDisplayMode()}|${host.getFilterMode()}|${hudMode}`;
       if (key !== lastGlKey) {
         lastGlKey = key;
         glCtx2d.clearRect(0, 0, gw, gh);
-        if (open) drawMenu(glCtx2d);
-        else drawHud(glCtx2d);
+        drawMenu(glCtx2d);
         glTex.baseTexture?.update?.();
       }
       try {

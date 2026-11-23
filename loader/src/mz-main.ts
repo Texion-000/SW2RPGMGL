@@ -171,10 +171,90 @@ async function launchMzGame(
     return;
   }
 
+  await preloadMzDatabase(runtime, async (loaded, total) => {
+    await splash?.draw(
+      game.title,
+      0.94 + 0.05 * (loaded / Math.max(1, total)),
+      `Loading game database (${loaded}/${total})...`,
+      'Reading data/*.json from SD card',
+    );
+  });
+
   splash?.dispose();
 
   log('[mz] Launching Scene_Boot via SceneManager.run(Scene_Boot)');
+  const bootT0 = performance.now();
+  const SceneBootProto = runtime.Scene_Boot?.prototype;
+  if (SceneBootProto && typeof SceneBootProto.start === 'function') {
+    const origBootStart = SceneBootProto.start;
+    let logged = false;
+    SceneBootProto.start = function (this: any) {
+      if (!logged) {
+        logged = true;
+        log(`[mz-boot] Scene_Boot ready after ${(performance.now() - bootT0).toFixed(0)}ms`);
+      }
+      return origBootStart.apply(this, arguments as any);
+    };
+  }
   runtime.SceneManager.run(runtime.Scene_Boot);
+}
+
+/**
+ * Load data/*.json while the WebGL loading screen is still up, instead of inside Scene_Boot, which
+ * otherwise shows several seconds of black screen on large MZ databases. Scene_Boot's own
+ * DataManager.loadDatabase() call is skipped once the preload succeeded. On any load error we fall
+ * back to the stock path so Scene_Boot reports and retries the error as usual.
+ */
+async function preloadMzDatabase(
+  runtime: any,
+  onProgress: (loaded: number, total: number) => Promise<void>,
+): Promise<void> {
+  const DM = runtime.DataManager;
+  const files: Array<{ name: string; src: string }> | undefined = DM?._databaseFiles;
+  if (!DM || typeof DM.loadDatabase !== 'function' || !Array.isArray(files) || files.length === 0) return;
+  if (DM.isBattleTest?.() || DM.isEventTest?.()) return;
+  const t0 = performance.now();
+  const countLoaded = () => {
+    let n = 0;
+    for (const f of files) if (runtime[f.name]) n++;
+    return n;
+  };
+  try {
+    DM.loadDatabase();
+  } catch (err) {
+    log(`[mz-boot] database preload failed to start: ${String(err)}`);
+    return;
+  }
+  const deadline = t0 + 90000;
+  let loaded = countLoaded();
+  let lastDraw = 0;
+  while (loaded < files.length) {
+    if (Array.isArray(DM._errors) && DM._errors.length > 0) {
+      log(`[mz-boot] database preload hit a load error (${DM._errors[0]?.src ?? '?'}); Scene_Boot will retry`);
+      return;
+    }
+    if (performance.now() > deadline) {
+      log(`[mz-boot] database preload timed out (${loaded}/${files.length}); Scene_Boot will continue it`);
+      return;
+    }
+    const now = performance.now();
+    if (now - lastDraw >= 100) {
+      lastDraw = now;
+      await onProgress(loaded, files.length);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    loaded = countLoaded();
+  }
+  log(`[mz-boot] database preloaded in ${(performance.now() - t0).toFixed(0)}ms (${files.length} files)`);
+  const origLoadDatabase = DM.loadDatabase;
+  let skipNext = true;
+  DM.loadDatabase = function (this: any) {
+    if (skipNext) {
+      skipNext = false;
+      if (!this.isBattleTest?.() && !this.isEventTest?.()) return;
+    }
+    return origLoadDatabase.apply(this, arguments as any);
+  };
 }
 
 async function boot(): Promise<void> {
