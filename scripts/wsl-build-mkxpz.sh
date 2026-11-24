@@ -55,6 +55,22 @@ if [ ! -f "$NRO_OUT" ]; then
   exit 1
 fi
 
+# mkxp-z stamps its own version (meson project version) into the NRO. Repack it with the SW2RPGMGL
+# version from launcher/Makefile so hbmenu shows the same version for every engine.
+APP_VERSION="$(sed -n 's/^APP_VERSION *:= *//p' "$PROJECT_DIR/launcher/Makefile" | tr -dc '0-9A-Za-z.-')"
+ELF_BIN="$WORK_DIR/build-switch2/mkxp-z.cortex-a78c"
+if [ -n "$APP_VERSION" ] && [ -f "$ELF_BIN" ]; then
+  echo "=== Stamping mkxp-z-switch2.nro with SW2RPGMGL version $APP_VERSION ==="
+  STAMP_DIR="$(mktemp -d)"
+  nacptool --create mkxp-z "SW2RPGMGL XP/VX/VX Ace engine (mkxp-z)" "$APP_VERSION" "$STAMP_DIR/mkxp-z.nacp" > /dev/null
+  python3 "$WORK_DIR/switch/nro/make_nro.py" "$DEVKITPRO/tools/bin/elf2nro" "$ELF_BIN" "$STAMP_DIR/mkxp-z.nacp" \
+    "$WORK_DIR/switch/icon.jpg" "$STAMP_DIR/mkxp-z.nro" "$STAMP_DIR/staging" \
+    "$WORK_DIR/switch/romfs-root" "$WORK_DIR/scripts/preload/win32_wrap.rb" > /dev/null
+  NRO_OUT="$STAMP_DIR/mkxp-z.nro"
+else
+  echo "[warning] Could not read APP_VERSION or find $ELF_BIN; keeping mkxp-z's own NRO version" >&2
+fi
+
 mkdir -p "$PROJECT_DIR/dist/sd-ready/switch/SW2RPGMGL/engines"
 cp -f "$NRO_OUT" "$PROJECT_DIR/dist/mkxp-z-switch2.nro"
 cp -f "$NRO_OUT" "$PROJECT_DIR/dist/sd-ready/switch/SW2RPGMGL/engines/mkxp-z-switch2.nro"

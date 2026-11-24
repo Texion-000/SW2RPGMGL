@@ -14,7 +14,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 
 APP_TITLE   := SW2RPGMGL
 APP_AUTHOR  := Switch 2 RPG Maker Game Launcher
-APP_VERSION := 0.4.0
+APP_VERSION := 0.3.1
 APP_ICON    := ../loader/icon.jpg
 
 TARGET      := SW2RPGMGL
@@ -56,7 +56,7 @@ $(BUILD)/main.o: src/main.cpp | $(BUILD)
 $(BUILD)/$(TARGET).elf: $(OBJS)
 	$(CXX) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
 
-$(BUILD)/$(TARGET).nacp: | $(BUILD)
+$(BUILD)/$(TARGET).nacp: Makefile | $(BUILD)
 	nacptool --create "$(APP_TITLE)" "$(APP_AUTHOR)" "$(APP_VERSION)" $@
 
 $(BUILD)/$(TARGET).nro: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).nacp $(APP_ICON)
