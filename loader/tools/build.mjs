@@ -305,17 +305,94 @@ mkdirSync(sdReadyGamesDir, { recursive: true });
 mkdirSync(sdReadyLogDir, { recursive: true });
 writeFileSync(
   join(sdReadyGamesDir, 'PUT_GAMES_HERE.txt'),
-  'Place your RPG Maker MV, MZ, and VX Ace / VX / XP game folders in this directory.\n',
+  'Place your RPG Maker MV, MZ, VX Ace / VX / XP, and WOLF RPG Editor game folders in this directory.\n',
 );
 copyFileSync(mvOutPath, join(sdReadyEnginesDir, 'mv-engine-switch2.nro'));
 copyFileSync(mzOutPath, join(sdReadyEnginesDir, 'mz-engine-switch2.nro'));
 copyFileSync(join(loaderDir, 'romfs', 'nxjs.ini'), join(sdReadyEnginesDir, 'nxjs.ini'));
+
+// Keep NACP version (and mkxp-z RomFS preload scripts) synchronized across companion NROs in dist/
+async function stampCompanionNro(nroPath, updateRomfsFn = null) {
+  if (!existsSync(nroPath)) return false;
+  const raw = readFileSync(nroPath);
+  const dec = await NRO.decode(new Blob([raw]));
+  const nacp = new NACP(await dec.nacp.arrayBuffer());
+  let changed = false;
+  if (nacp.version !== meta.version) {
+    nacp.version = meta.version;
+    changed = true;
+  }
+  let romfsBlob = dec.romfs;
+  if (updateRomfsFn && dec.romfs) {
+    const rfs = await RomFS.decode(dec.romfs);
+    if (await updateRomfsFn(rfs)) {
+      romfsBlob = await RomFS.encode(rfs);
+      changed = true;
+    }
+  }
+  if (changed) {
+    const repacked = await NRO.encode({
+      ...dec,
+      nacp: new Blob([new Uint8Array(nacp.buffer)]),
+      romfs: romfsBlob,
+    });
+    writeFileSync(nroPath, Buffer.from(await repacked.arrayBuffer()));
+    console.log(`[build] Stamped ${nroPath} -> v${meta.version}`);
+  }
+  return true;
+}
+
 const mkxpzDist = join(distDir, 'mkxp-z-switch2.nro');
-if (existsSync(mkxpzDist)) {
+if (
+  await stampCompanionNro(mkxpzDist, async (rfs) => {
+    if (!rfs?.preload) return false;
+    let touched = false;
+    const compatPath = join(loaderDir, '..', 'scripts', 'mkxpz', 'preload-compat-v2.rb');
+    if (existsSync(compatPath) && rfs.preload['win32api_stub.rb']) {
+      const compatSrc = readFileSync(compatPath, 'utf8').replace(/\r\n/g, '\n');
+      let stubText = (await rfs.preload['win32api_stub.rb'].text()).replace(/\r\n/g, '\n');
+      const marker = '\n# [switch2-preload-compat-v2]';
+      const idx = stubText.indexOf(marker);
+      const baseStub = idx >= 0 ? stubText.slice(0, idx) : stubText;
+      const nextStub = baseStub + (compatSrc.startsWith('\n') ? compatSrc : '\n' + compatSrc);
+      if (nextStub !== stubText) {
+        rfs.preload['win32api_stub.rb'] = new Blob([nextStub]);
+        touched = true;
+      }
+    }
+    const loadScreenPath = join(loaderDir, '..', 'scripts', 'mkxpz', 'loading-screen.rb');
+    if (existsSync(loadScreenPath) && rfs.preload['loading_screen.rb']) {
+      const lsSrc = readFileSync(loadScreenPath, 'utf8').replace(/\r\n/g, '\n');
+      const curLs = (await rfs.preload['loading_screen.rb'].text()).replace(/\r\n/g, '\n');
+      if (lsSrc !== curLs) {
+        rfs.preload['loading_screen.rb'] = new Blob([lsSrc]);
+        touched = true;
+      }
+    }
+    const hooksPath = join(loaderDir, '..', 'scripts', 'mkxpz', 'win32-hooks.rb');
+    if (existsSync(hooksPath) && rfs.preload['win32_wrap.rb']) {
+      const hooksSrc = readFileSync(hooksPath, 'utf8').replace(/\r\n/g, '\n');
+      const curWrap = (await rfs.preload['win32_wrap.rb'].text()).replace(/\r\n/g, '\n');
+      const hMarker = '\n# [switch2-win32-hooks-v1]';
+      const hIdx = curWrap.indexOf(hMarker);
+      const baseWrap = hIdx >= 0 ? curWrap.slice(0, hIdx) : curWrap.replace(/\n+$/, '');
+      const nextWrap = baseWrap + '\n' + hooksSrc.replace(/^\n+/, '');
+      if (nextWrap !== curWrap) {
+        rfs.preload['win32_wrap.rb'] = new Blob([nextWrap]);
+        touched = true;
+      }
+    }
+    return touched;
+  })
+) {
   copyFileSync(mkxpzDist, join(sdReadyEnginesDir, 'mkxp-z-switch2.nro'));
 }
+const wolfDist = join(distDir, 'wolf-engine-switch2.nro');
+if (await stampCompanionNro(wolfDist)) {
+  copyFileSync(wolfDist, join(sdReadyEnginesDir, 'wolf-engine-switch2.nro'));
+}
 const launcherDist = join(distDir, 'SW2RPGMGL.nro');
-if (existsSync(launcherDist)) {
+if (await stampCompanionNro(launcherDist)) {
   copyFileSync(launcherDist, join(sdReadyAppDir, 'SW2RPGMGL.nro'));
 }
 console.log(`[build] Staged SD-ready SW2RPGMGL layout -> ${sdReadyAppDir}`);

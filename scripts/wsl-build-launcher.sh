@@ -32,7 +32,7 @@ fi
 mkdir -p "$DIST_DIR" "$SD_READY_DIR/engines" "$SD_READY_DIR/games" "$SD_READY_DIR/log"
 cp -f "$NRO_OUT" "$DIST_DIR/SW2RPGMGL.nro"
 cp -f "$NRO_OUT" "$SD_READY_DIR/SW2RPGMGL.nro"
-printf 'Place your RPG Maker MV, MZ, and VX Ace / VX / XP game folders in this directory.\n' > "$SD_READY_DIR/games/PUT_GAMES_HERE.txt"
+printf 'Place your RPG Maker MV, MZ, VX Ace / VX / XP, and WOLF RPG Editor game folders in this directory.\n' > "$SD_READY_DIR/games/PUT_GAMES_HERE.txt"
 
 # Stage engines if present in dist/
 if [ -f "$DIST_DIR/mv-engine-switch2.nro" ]; then
@@ -46,6 +46,9 @@ if [ -f "$PROJECT_DIR/loader/romfs/nxjs.ini" ]; then
 fi
 if [ -f "$DIST_DIR/mkxp-z-switch2.nro" ]; then
   cp -f "$DIST_DIR/mkxp-z-switch2.nro" "$SD_READY_DIR/engines/mkxp-z-switch2.nro"
+fi
+if [ -f "$DIST_DIR/wolf-engine-switch2.nro" ]; then
+  cp -f "$DIST_DIR/wolf-engine-switch2.nro" "$SD_READY_DIR/engines/wolf-engine-switch2.nro"
 fi
 
 echo ""

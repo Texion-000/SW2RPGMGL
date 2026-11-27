@@ -21,6 +21,7 @@ function engineBadgeColor(engine: GameEngine): [string, string] {
     case 'vxace': return ['#4d1d3a', '#ff7aa8'];
     case 'vx': return ['#4c3214', '#ffb85c'];
     case 'xp': return ['#14453d', '#52e3c2'];
+    case 'wolf': return ['#4a3319', '#ffcf87'];
   }
 }
 

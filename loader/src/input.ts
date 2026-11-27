@@ -65,23 +65,66 @@ export function createInputBridge(): InputBridge {
   let prevMinus = false;
   let touchInstalled = false;
   let overlayOpen = false;
+  let waitMenuReleaseFrames = 0;
   let resumeCooldown = 0;
   let attachedRuntime: Record<string, any> | null = null;
 
-  function clearGameInput(): void {
-    try { attachedRuntime?.Input?.clear?.(); } catch { /* ignore */ }
+  /**
+   * Soft-reset active Input state WITHOUT calling `Input.clear()`.
+   * Calling `Input.clear()` triggers `VisuMZ_0_CoreEngine`'s `this._gamepadWait = 24`,
+   * which suppresses `Input._pollGamepads()` and caused multi-second / permanent button
+   * lockups after closing the Minus (-) Quick Menu!
+   */
+  function softResetGameInput(): void {
+    const Input = attachedRuntime?.Input;
+    if (Input) {
+      const cs = Input._currentState;
+      if (cs && typeof cs === 'object') {
+        for (const k of Object.keys(cs)) cs[k] = false;
+      }
+      const ps = Input._previousState;
+      if (ps && typeof ps === 'object') {
+        for (const k of Object.keys(ps)) ps[k] = false;
+      }
+      Input._latestButton = null;
+      Input._pressedTime = 0;
+      Input._dir4 = 0;
+      Input._dir8 = 0;
+      Input._preferredAxis = '';
+      if ('_latestKeyCode' in Input) Input._latestKeyCode = null;
+      if ('_inputSpecialKeyCode' in Input) Input._inputSpecialKeyCode = undefined;
+      if ('_gamepadWait' in Input) Input._gamepadWait = 0;
+    }
     try { attachedRuntime?.TouchInput?.clear?.(); } catch { /* ignore */ }
+  }
+
+  function areMenuCloseButtonsHeld(): boolean {
+    try {
+      const pads = navigator.getGamepads?.();
+      if (!pads) return false;
+      for (const pad of pads) {
+        if (!pad || !pad.connected) continue;
+        const b = pad.buttons;
+        // Wait only for B (0), A (1), or Minus (8) to release — never block on D-Pad/Stick/Dash
+        if (b?.[0]?.pressed || b?.[1]?.pressed || b?.[8]?.pressed) return true;
+      }
+    } catch { /* ignore */ }
+    return false;
   }
 
   function setOverlayOpen(open: boolean): void {
     if (overlayOpen === open) return;
     overlayOpen = open;
     (globalThis as any).__drOverlayOpen = open;
-    clearGameInput();
-    if (!open) {
-      // Wait a few frames + until menu buttons (A, B, Minus, D-Pad) are released
-      // so closing the overlay never triggers an in-game action or movement.
-      resumeCooldown = 12;
+    softResetGameInput();
+    if (open) {
+      waitMenuReleaseFrames = 0;
+      resumeCooldown = 0;
+    } else {
+      // Wait until A/B/Minus are released (capped at 45 frames) + 2 settle frames
+      // so closing the overlay never leaks an A/B press into the game or locks up VisuMZ Input.
+      waitMenuReleaseFrames = areMenuCloseButtonsHeld() ? 45 : 0;
+      resumeCooldown = 2;
     }
   }
 
@@ -89,9 +132,22 @@ export function createInputBridge(): InputBridge {
     try {
       const pads = navigator.getGamepads?.();
       if (!pads) return null;
+      let firstConnected: Gamepad | null = null;
       for (const pad of pads) {
-        if (pad && pad.connected) return pad;
+        if (!pad || !pad.connected) continue;
+        if (!firstConnected) firstConnected = pad;
+        const btns = pad.buttons;
+        if (btns) {
+          for (let i = 0; i < btns.length; i++) {
+            if (btns[i]?.pressed) return pad;
+          }
+        }
+        const axes = pad.axes;
+        if (axes && (Math.abs(axes[0] ?? 0) > 0.45 || Math.abs(axes[1] ?? 0) > 0.45)) {
+          return pad;
+        }
       }
+      return firstConnected;
     } catch { /* ignore */ }
     return null;
   }
@@ -152,16 +208,60 @@ export function createInputBridge(): InputBridge {
         addExtraSymbol('next', 3);
       }
 
-      // Apply Switch 2 gamepad mapper (overrides Mano_InputConfig default safely)
-      Input.gamepadMapper = { ...DEFAULT_MV_GAMEPAD_MAP };
+      const hasOmoriGamepadMap = typeof ConfigManager?.setDefaultGamepadKeyMap === 'function';
+      const OMORI_SWITCH2_GAMEPAD_MAP: Record<number, string> = {
+        0: 'escape',    // Switch B (South) -> Cancel / Menu
+        1: 'ok',        // Switch A (East)  -> Confirm
+        2: 'shift',     // Switch Y (West)  -> Run
+        3: 'tag',       // Switch X (North) -> Tag
+        4: 'pageup',    // Switch L         -> LB
+        5: 'pagedown',  // Switch R         -> RB
+        6: 'tab',       // Switch ZL
+        7: 'SEVEN7',    // Switch ZR
+        8: 'SIX6',      // Reserved Minus slot placeholder for Options 1-to-1 button table
+        9: 'NINE9',
+        10: 'TEN10',
+        11: 'ELEVEN11',
+        12: 'up',
+        13: 'down',
+        14: 'left',
+        15: 'right',
+        16: 'SIXTEEN16',
+      };
 
-      // Preserve Switch 2 defaults when Mano_InputConfig runs ConfigManager.applyData()
+      if (hasOmoriGamepadMap) {
+        addExtraSymbol('control', 7);
+        ConfigManager.setDefaultGamepadKeyMap = function () {
+          Input.gamepadMapper = { ...OMORI_SWITCH2_GAMEPAD_MAP };
+        };
+        if (typeof ConfigManager.setDefaultKeyboardKeyMap === 'function') {
+          ConfigManager.setDefaultKeyboardKeyMap();
+        }
+        ConfigManager.setDefaultGamepadKeyMap();
+        if ('gamepadTips' in ConfigManager) {
+          ConfigManager.gamepadTips = true;
+        }
+      } else {
+        // Apply Switch 2 gamepad mapper (overrides Mano_InputConfig default safely)
+        Input.gamepadMapper = { ...DEFAULT_MV_GAMEPAD_MAP };
+      }
+
+      // Preserve Switch 2 defaults when Mano_InputConfig / Omori BASE runs ConfigManager.applyData()
       // on Scene_Boot (while still respecting explicit user remappings saved in config.rpgsave).
       if (ConfigManager && typeof ConfigManager.applyData === 'function' && !ConfigManager.__drGamepadHooked) {
         ConfigManager.__drGamepadHooked = true;
         const origApplyData = ConfigManager.applyData;
         ConfigManager.applyData = function (config: Record<string, any>) {
           const res = origApplyData.call(this, config);
+          if (hasOmoriGamepadMap) {
+            if (!config || !config.gamepadInputMap) {
+              Input.gamepadMapper = { ...OMORI_SWITCH2_GAMEPAD_MAP };
+            }
+            if (!config || config.gamepadTips === undefined) {
+              this.gamepadTips = true;
+            }
+            return res;
+          }
           if (!config || !config.GAMEPAD_CONFIG) {
             Input.gamepadMapper = { ...DEFAULT_MV_GAMEPAD_MAP };
           } else {
@@ -275,31 +375,81 @@ export function createInputBridge(): InputBridge {
         down: 40,
       };
 
+      // Advance overlay-resume cooldown once per frame in Input.update (never inside _updateGamepadState)
+      // and clear VisuMZ_0_CoreEngine's `_gamepadWait` so gamepad polling never stalls after overlay close.
+      if (typeof Input.update === 'function' && !Input.__drUpdateWrapped) {
+        Input.__drUpdateWrapped = true;
+        const origInputUpdate = Input.update;
+        Input.update = function () {
+          if (overlayOpen) {
+            softResetGameInput();
+            return;
+          }
+          if (waitMenuReleaseFrames > 0 || resumeCooldown > 0) {
+            if ('_gamepadWait' in this && this._gamepadWait > 0) {
+              this._gamepadWait = 0;
+            }
+            if (waitMenuReleaseFrames > 0) {
+              if (!areMenuCloseButtonsHeld()) {
+                waitMenuReleaseFrames = 0;
+              } else {
+                waitMenuReleaseFrames--;
+              }
+            } else if (resumeCooldown > 0) {
+              resumeCooldown--;
+            }
+          }
+          return origInputUpdate.call(this);
+        };
+      }
+
       // Wrap _updateGamepadState so Left Stick + ZL/ZR/L/R + custom plugin symbols always register smoothly
-      // and suppress all in-game gamepad input while the Minus (-) Quick Menu is open.
+      // and suppress all in-game gamepad input while the Minus (-) Quick Menu is open or settling.
       const origUpdate = Input._updateGamepadState?.bind(Input);
       if (origUpdate && !Input.__drPatched) {
         Input.__drPatched = true;
         Input._updateGamepadState = function (gamepad: Gamepad) {
-          if (overlayOpen) {
-            this.clear?.();
-            return;
+          // Keep Switch Minus (button 8) exclusive to the Quick Menu even if a plugin (e.g. NEO_InputConfig)
+          // overwrote Input.gamepadMapper on Scene_Boot.start and bound 8:'tab' while leaving ZL (6) blank.
+          const gm = this.gamepadMapper;
+          if (gm && gm[8] && gm[8] !== 'SIX6') {
+            if (!gm[6]) gm[6] = gm[8];
+            delete gm[8];
           }
-          if (resumeCooldown > 0) {
-            resumeCooldown--;
-            const b = gamepad?.buttons;
-            const held = Boolean(
-              b?.[0]?.pressed || b?.[1]?.pressed || b?.[8]?.pressed ||
-              b?.[12]?.pressed || b?.[13]?.pressed || b?.[14]?.pressed || b?.[15]?.pressed,
-            );
-            if (held && resumeCooldown < 4) resumeCooldown = 4;
-            this.clear?.();
+          if (gm && gm[7] === '') {
+            gm[7] = 'control';
+          }
+
+          if (overlayOpen || waitMenuReleaseFrames > 0 || resumeCooldown > 0) {
+            const btns = gamepad?.buttons;
+            if (btns && this._gamepadStates) {
+              const sync: boolean[] = [];
+              for (let i = 0; i < btns.length; i++) {
+                sync[i] = i === 8 ? false : Boolean(btns[i]?.pressed);
+              }
+              this._gamepadStates[gamepad.index] = sync;
+            }
+            const cs = this._currentState;
+            if (cs && typeof cs === 'object') {
+              for (const k of Object.keys(cs)) cs[k] = false;
+            }
+            this._latestButton = null;
+            this._pressedTime = 0;
+            if ('_gamepadWait' in this) this._gamepadWait = 0;
             return;
           }
           const prevRaw = this._gamepadStates?.[gamepad.index];
           const prevState = Array.isArray(prevRaw) ? prevRaw.slice() : [];
           origUpdate(gamepad);
           const state = this._gamepadStates?.[gamepad.index];
+          // Never allow physical button 8 (Minus) to trigger OMORI placeholder 'SIX6' in-game
+          if (state && state.length > 8 && state[8]) {
+            state[8] = false;
+            if (gm?.[8] && this._currentState) {
+              this._currentState[gm[8]] = false;
+              if (this._latestButton === gm[8]) this._latestButton = null;
+            }
+          }
           if (gamepad?.axes && state) {
             const threshold = 0.45;
             const ax = gamepad.axes[0] ?? 0;

@@ -1,8 +1,8 @@
 {
   "name": "sw2rpgmgl",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
-  "description": "SW2RPGMGL — Switch 2 RPG Maker Game Launcher (MV, MZ & VX Ace / VX / XP) for Nintendo Switch 2 (kaiHEN / ounce-devkit)",
+  "description": "SW2RPGMGL — Switch 2 RPG Maker Game Launcher (MV, MZ, VX Ace / VX / XP & WOLF) for Nintendo Switch 2 (kaiHEN / ounce-devkit)",
   "type": "module",
   "scripts": {
     "build": "node tools/build.mjs",
@@ -13,7 +13,7 @@
     "id": "016d766c6f616400",
     "title": "SW2RPGMGL MV Engine",
     "author": "SW2RPGMGL",
-    "version": "0.3.1"
+    "version": "0.3.2"
   },
   "devDependencies": {
     "@tootallnate/nacp": "^0.2.0",

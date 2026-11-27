@@ -13,12 +13,13 @@
  *    `Tilemap` toroidal cache, fast zero-alloc `rotateHue`, `Sprite_Character` revision caching)
  */
 import type { AssetReader } from './assets';
-import type { BrowserHost, ScriptFilter } from './browser-host';
+import { syncCanvas2DPluginPrototypes, type BrowserHost, type ScriptFilter } from './browser-host';
 import { log } from './log';
 
 /** Default plugins that are PC/editor-only or replaced by native Switch 2 C++ subsystems. */
 export const DEFAULT_SKIPPED_PLUGINS = new Set([
   'AudioStreaming.js',      // Replaced by native C++ FFmpeg WebAudio decode in nx.js
+  'OggOnly.js',             // Replaced by native C++ FFmpeg WebAudio decode in nx.js (skips slow JS stbvorbis)
   'DevToolsManage.js',      // PC NW.js DevTools / F12 menu bar
   'TRP_ParticleEditor.js',  // Editor-only particle disk writer (TRP_Particle stays enabled!)
   '111_InputForm.js',       // Replaced by Switch 2 native swkbd (prompt()) hook below
@@ -35,6 +36,8 @@ export interface MvCompatOptions {
   audioSupport?: AudioSupport;
   /** Reuse $dataMap + Spriteset_Map when returning from pause-menu scenes (default true). */
   fastMenu?: boolean;
+  /** Live2D Cubism Core mesh update rate: 'auto' (halve only when measured slow), 'half', 'full'. */
+  live2dUpdateRate?: 'auto' | 'half' | 'full';
   onFatalError?: (title: string, detail: string) => void;
 }
 
@@ -76,7 +79,7 @@ export function stripTopLevelUseStrict(source: string): string {
  * shared Global Lexical Environment semantics across multiple plugin files).
  */
 export function exposeTopLevelLexicals(source: string): string {
-  if (!/\b(?:const|let|class)\s+[A-Za-z_$]/.test(source)) {
+  if (!/(?:^|[;\r\n{}])\s*(?:const|let|class)\s+[A-Za-z_${[]/.test(source)) {
     return source;
   }
   const n = source.length;
@@ -127,18 +130,17 @@ export function exposeTopLevelLexicals(source: string): string {
       continue;
     }
 
-    // Line comment
+    // Line comment (SIMD indexOf jump)
     if (c === 47 /* / */ && i + 1 < n && source.charCodeAt(i + 1) === 47 /* / */) {
-      i += 2;
-      while (i < n && source.charCodeAt(i) !== 10) i++;
+      const nl = source.indexOf('\n', i + 2);
+      i = nl < 0 ? n : nl;
       continue;
     }
 
-    // Block comment
+    // Block comment (SIMD indexOf jump — skips 480 KB JSDoc headers in <0.1ms)
     if (c === 47 /* / */ && i + 1 < n && source.charCodeAt(i + 1) === 42 /* * */) {
-      i += 2;
-      while (i + 1 < n && !(source.charCodeAt(i) === 42 && source.charCodeAt(i + 1) === 47)) i++;
-      i += 2;
+      const end = source.indexOf('*/', i + 2);
+      i = end < 0 ? n : end + 2;
       continue;
     }
 
@@ -324,6 +326,339 @@ export function exposeTopLevelLexicals(source: string): string {
   return out;
 }
 
+/**
+ * Constant-fold `javascript-obfuscator` string-table indirections (`_0xabc(0x1f0)` -> `"apply"`,
+ * `_0xabc('0x1f0')` -> `"apply"`, and `obj[_0xabc(0x1f0)]` -> `obj.apply`) in memory at script load time.
+ *
+ * Supports both top-of-file preludes (Live2D Cubism 4 `enc_lv2d.js`, older MV plugins) and hoisted
+ * mid/end-of-file `function _0xTable()` + `function _0xDec()` layouts (VisuStella MZ & modern obfuscator).
+ * Also flattens self-overwriting decoder wrappers (`return _0xDec = function...`) and pre-bakes rotated
+ * string arrays so neither startup rotation IIFEs nor any dynamic fallback calls allocate closures on
+ * `--jitless` V8!
+ */
+export function foldObfuscatedStringTable(code: string, pathLabel = ''): string {
+  if (!code.includes('_0x')) return code;
+  const t0 = performance.now();
+
+  // 1. Locate string table anywhere in script:
+  //    - Modern hoisted function table: `function _0xTable(){ const a = [...]; _0xTable = function(){ return a; }; return _0xTable(); }`
+  //    - Array literal table: `var/const/let _0xTable = [...];`
+  let tableName = '';
+  let tableCode = '';
+  let tableStart = -1;
+  let tableEnd = -1;
+  let isFnTable = false;
+
+  const fnTableRe =
+    /function (_0x[0-9a-f]+)\(\)\{(?:const|var|let) (_0x[0-9a-f]+)=\[[\s\S]*?\];\1=function\(\)\{return \2;\};return \1\(\);\}/;
+  const fm = fnTableRe.exec(code);
+  if (fm) {
+    tableName = fm[1];
+    tableCode = fm[0];
+    tableStart = fm.index;
+    tableEnd = fm.index + fm[0].length;
+    isFnTable = true;
+  } else {
+    const arrTableRe =
+      /(?:const|var|let) (_0x[0-9a-f]+)=\[(?:'(?:\\[\s\S]|[^'\\])*'|"(?:\\[\s\S]|[^"\\])*"|\s|,){8,}\];/;
+    const am = arrTableRe.exec(code);
+    if (am) {
+      tableName = am[1];
+      tableCode = am[0];
+      tableStart = am.index;
+      tableEnd = am.index + am[0].length;
+    }
+  }
+  if (!tableName) return code;
+
+  // 2. Locate decoder function referencing `tableName`
+  const escTable = tableName.replace(/\$/g, '\\$');
+  const selfOverwriteRe = new RegExp(
+    `function (_0x[0-9a-f]+)\\((_0x[0-9a-f]+),(_0x[0-9a-f]+)\\)\\{(?:const|var|let) (_0x[0-9a-f]+)=${escTable}\\(\\);return \\1=function\\((_0x[0-9a-f]+),(_0x[0-9a-f]+)\\)\\{([^}]{1,260})\\},\\1\\(\\2,\\3\\);\\}`,
+  );
+  const directFnRe = new RegExp(
+    `function (_0x[0-9a-f]+)\\(_0x[0-9a-f]+,_0x[0-9a-f]+\\)\\{[^}]{1,260}\\b${escTable}\\(\\)[^}]{1,160}\\}`,
+  );
+  const varFnRe = new RegExp(
+    `(?:const|var|let) (_0x[0-9a-f]+)=function\\(_0x[0-9a-f]+,_0x[0-9a-f]+\\)\\{[^}]{1,260}\\b${escTable}\\[[^}]{1,160}\\};`,
+  );
+
+  let decName = '';
+  let decCode = '';
+  let fastDecCode = '';
+  let decStart = -1;
+  let decEnd = -1;
+
+  const sm = selfOverwriteRe.exec(code);
+  if (sm) {
+    decName = sm[1];
+    decCode = sm[0];
+    // Flatten self-overwriting wrapper so outer aliases (`const _0xAlias = _0xDec`) NEVER allocate closures!
+    fastDecCode = `function ${sm[1]}(${sm[5]},${sm[6]}){var ${sm[4]}=${tableName}();${sm[7]}}`;
+    decStart = sm.index;
+    decEnd = sm.index + sm[0].length;
+  } else {
+    const dm = directFnRe.exec(code) || varFnRe.exec(code);
+    if (dm) {
+      decName = dm[1];
+      decCode = dm[0];
+      fastDecCode = decCode;
+      decStart = dm.index;
+      decEnd = dm.index + dm[0].length;
+    }
+  }
+  if (!decName) return code;
+
+  // 3. Locate optional rotation IIFE:
+  //    - Standalone: `(function(a,b){...}(tableName, expr))` or `(function(a,b){...})(tableName, expr)`
+  //    - Comma-grouped (`(function(a,b){...}(tableName, expr), mainIife())`): match without outer `(` so `(void 0, mainIife())` stays balanced!
+  const standaloneIifeRe = new RegExp(
+    `\\(function\\(_0x[0-9a-f]+,_0x[0-9a-f]+\\)\\{[\\s\\S]{40,4000}?\\}\\s*(?:\\(\\s*${escTable}\\s*,[0-9a-fx+\\-*()\\s]{1,160}\\)\\)|\\)\\s*\\(\\s*${escTable}\\s*,[0-9a-fx+\\-*()\\s]{1,160}\\))`,
+  );
+  const commaIifeRe = new RegExp(
+    `function\\(_0x[0-9a-f]+,_0x[0-9a-f]+\\)\\{[\\s\\S]{40,4000}?\\}\\s*\\(\\s*${escTable}\\s*,[0-9a-fx+\\-*()\\s]{1,160}\\)(?=\\s*,)`,
+  );
+  let iifeCode = '';
+  let iifeEvalCode = '';
+  let iifeStart = -1;
+  let iifeEnd = -1;
+  const sim = standaloneIifeRe.exec(code);
+  if (sim) {
+    iifeCode = sim[0];
+    iifeEvalCode = sim[0];
+    iifeStart = sim.index;
+    iifeEnd = sim.index + sim[0].length;
+  } else {
+    const cim = commaIifeRe.exec(code);
+    if (cim) {
+      iifeCode = cim[0];
+      iifeEvalCode = `(${cim[0]})`;
+      iifeStart = cim.index;
+      iifeEnd = cim.index + cim[0].length;
+    }
+  }
+  // Safety invariant: if `tableName` is passed as first argument to an unrecognized rotation call, never fold unrotated!
+  if (!iifeCode && new RegExp(`\\(\\s*${escTable}\\s*,`).test(code)) {
+    return code;
+  }
+
+  const evalBundle = `${tableCode}\n${fastDecCode}\n${iifeEvalCode ? iifeEvalCode + ';' : ''}`;
+  if (/\b(?:eval|Function|require|fetch|XMLHttpRequest|document|window|process)\b/.test(evalBundle)) {
+    return code;
+  }
+
+  let decFn: ((idx: number) => any) | null = null;
+  let rotatedArr: string[] | null = null;
+  try {
+    const res = new Function(
+      `${evalBundle}\nreturn { dec: ${decName}, tbl: ${isFnTable ? tableName + '()' : tableName} };`,
+    )() as { dec: (idx: number) => any; tbl: unknown };
+    decFn = res?.dec ?? null;
+    if (Array.isArray(res?.tbl) && res.tbl.every((x) => typeof x === 'string')) {
+      rotatedArr = res.tbl as string[];
+    }
+  } catch {
+    return code;
+  }
+  if (typeof decFn !== 'function') return code;
+
+  // 4. Propagate direct decoder aliases (`_0xAlias = _0xDec`) across all scopes
+  const aliases = new Set<string>([decName]);
+  const pairs: Array<[string, string]> = [];
+  const aliasRe = /\b(_0x[0-9a-f]+)\s*=\s*(_0x[0-9a-f]+)\b/g;
+  let am: RegExpExecArray | null;
+  while ((am = aliasRe.exec(code)) !== null) {
+    pairs.push([am[1], am[2]]);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 0; i < pairs.length; i++) {
+      const [lhs, rhs] = pairs[i];
+      if (aliases.has(rhs) && !aliases.has(lhs)) {
+        aliases.add(lhs);
+        changed = true;
+      }
+    }
+  }
+
+  // Pre-bake rotated array + flattened decoder + elide rotation IIFE so script eval skips O(N) rotation
+  let working = code;
+  const protectedSpans: Array<{ start: number; end: number }> = [];
+  if (rotatedArr) {
+    const edits: Array<{ start: number; end: number; rep: string }> = [
+      {
+        start: tableStart,
+        end: tableEnd,
+        rep: isFnTable
+          ? `function ${tableName}(){var a=${JSON.stringify(rotatedArr)};${tableName}=function(){return a;};return a;}`
+          : `var ${tableName}=${JSON.stringify(rotatedArr)};`,
+      },
+    ];
+    if (fastDecCode !== decCode) {
+      edits.push({ start: decStart, end: decEnd, rep: fastDecCode });
+    } else {
+      edits.push({ start: decStart, end: decEnd, rep: decCode });
+    }
+    if (iifeStart >= 0) {
+      edits.push({ start: iifeStart, end: iifeEnd, rep: 'void 0' });
+    }
+    edits.sort((a, b) => a.start - b.start);
+    let overlapping = false;
+    for (let i = 1; i < edits.length; i++) {
+      if (edits[i].start < edits[i - 1].end) {
+        overlapping = true;
+        break;
+      }
+    }
+    if (!overlapping) {
+      let built = '';
+      let cur = 0;
+      for (const ed of edits) {
+        built += working.slice(cur, ed.start);
+        const ns = built.length;
+        built += ed.rep;
+        protectedSpans.push({ start: ns, end: built.length });
+        cur = ed.end;
+      }
+      built += working.slice(cur);
+      working = built;
+    }
+  }
+  if (protectedSpans.length === 0) {
+    protectedSpans.push({ start: tableStart, end: tableEnd });
+    protectedSpans.push({ start: decStart, end: decEnd });
+    if (iifeStart >= 0) protectedSpans.push({ start: iifeStart, end: iifeEnd });
+  }
+
+  const inProtectedSpan = (off: number): boolean => {
+    for (let i = 0; i < protectedSpans.length; i++) {
+      const sp = protectedSpans[i];
+      if (off >= sp.start && off < sp.end) return true;
+    }
+    return false;
+  };
+
+  const NON_OBJ_KW = new Set([
+    'return', 'case', 'throw', 'typeof', 'void', 'delete',
+    'in', 'of', 'instanceof', 'new', 'yield', 'await', 'else', 'do',
+  ]);
+  const STMT_PAREN_KW = new Set(['if', 'for', 'while', 'switch', 'catch', 'with']);
+  const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+  const isIdentChar = (c: number) =>
+    (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36;
+
+  const canEmitDotAt = (str: string, offset: number): boolean => {
+    if (offset <= 0) return false;
+    const pc = str.charCodeAt(offset - 1);
+    if (pc === 93 /* ] */) return true;
+    if (pc === 41 /* ) */) {
+      let depth = 1;
+      let k = offset - 2;
+      while (k >= 0 && depth > 0) {
+        const kc = str.charCodeAt(k);
+        if (kc === 41) depth++;
+        else if (kc === 40) depth--;
+        k--;
+      }
+      if (depth === 0) {
+        while (k >= 0 && (str.charCodeAt(k) === 32 || str.charCodeAt(k) === 9)) k--;
+        const we = k + 1;
+        while (k >= 0 && isIdentChar(str.charCodeAt(k))) k--;
+        const kw = str.slice(k + 1, we);
+        if (kw.length > 0 && !STMT_PAREN_KW.has(kw)) return true;
+      }
+    } else if (isIdentChar(pc)) {
+      let ws = offset - 1;
+      while (ws > 0 && isIdentChar(str.charCodeAt(ws - 1))) ws--;
+      const prevWord = str.slice(ws, offset);
+      const fc = prevWord.charCodeAt(0);
+      if (!(fc >= 48 && fc <= 57) && !NON_OBJ_KW.has(prevWord)) return true;
+    }
+    return false;
+  };
+
+  const callRe =
+    /(['"`])(?:\\[\s\S]|(?!\1)[\s\S])*?\1|\/\/[^\n]*|\/\*[\s\S]*?\*\/|(\[\s*)?(\b_0x[0-9a-f]+)\((0x[0-9a-f]+|\d+|'(?:0x[0-9a-f]+|\d+)'|"(?:0x[0-9a-f]+|\d+)")\)(\s*\])?/g;
+  let replaced = 0;
+  let dotProps = 0;
+  let rewritten = working.replace(
+    callRe,
+    (full, quote, openBr, fnId, argStr, closeBr, offset, str) => {
+      if (quote || !fnId || !aliases.has(fnId) || inProtectedSpan(offset)) return full;
+      const rawArg =
+        argStr.charCodeAt(0) === 39 || argStr.charCodeAt(0) === 34
+          ? argStr.slice(1, -1)
+          : argStr;
+      let val: any;
+      try {
+        val = decFn!(Number(rawArg));
+      } catch {
+        return full;
+      }
+      if (typeof val !== 'string') return full;
+      replaced++;
+      const jsonLit = JSON.stringify(val);
+      if (openBr && closeBr && val !== '__proto__' && IDENT_RE.test(val) && canEmitDotAt(str, offset)) {
+        const afterIdx = offset + full.length;
+        const trail = afterIdx < str.length && isIdentChar(str.charCodeAt(afterIdx)) ? ' ' : '';
+        dotProps++;
+        return '.' + val + trail;
+      }
+      return (openBr || '') + jsonLit + (closeBr || '');
+    },
+  );
+  if (replaced === 0) return code;
+
+  // Fold split-string bracket accesses `obj["foo" + "bar"]` -> `obj.foobar` (from `splitStrings: true`)
+  if (rewritten.includes('"+') || rewritten.includes('" +')) {
+    const concatBracketRe =
+      /(`(?:\\[\s\S]|[^`\\])*`|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\n]*|\/\*[\s\S]*?\*\/)|\[\s*("(?:\\[\s\S]|[^"\\])*"(?:\s*\+\s*"(?:\\[\s\S]|[^"\\])*")+)\s*\]/g;
+    rewritten = rewritten.replace(concatBracketRe, (full, skip, chain, offset, str) => {
+      if (skip || !chain) return full;
+      let joined = '';
+      const partRe = /"(?:\\[\s\S]|[^"\\])*"/g;
+      let pm: RegExpExecArray | null;
+      while ((pm = partRe.exec(chain)) !== null) {
+        try {
+          joined += JSON.parse(pm[0]);
+        } catch {
+          return full;
+        }
+      }
+      if (joined !== '__proto__' && IDENT_RE.test(joined) && canEmitDotAt(str, offset)) {
+        const afterIdx = offset + full.length;
+        const trail = afterIdx < str.length && isIdentChar(str.charCodeAt(afterIdx)) ? ' ' : '';
+        dotProps++;
+        return '.' + joined + trail;
+      }
+      return '[' + JSON.stringify(joined) + ']';
+    });
+  }
+
+  // Strip per-frame leaked `this.gl.createTexture(), this.gl.createFramebuffer(),` in Cubism4 setupClippingContext
+  rewritten = rewritten.replace(
+    /this(?:\.gl|\['gl'\]|\["gl"\])(?:\.createTexture|\["createTexture"\])\(\)\s*,\s*this(?:\.gl|\['gl'\]|\["gl"\])(?:\.createFramebuffer|\["createFramebuffer"\])\(\)\s*,/g,
+    '',
+  );
+  try {
+    // Verify syntax safety before committing the folded script
+    new Function(rewritten);
+  } catch {
+    return code;
+  }
+  if (pathLabel) {
+    const dt = performance.now() - t0;
+    if (replaced >= 2000 || dt >= 25) {
+      log(
+        `[script] folded ${replaced} string-table calls (${dotProps} dot-props) in ${pathLabel} ` +
+        `(${dt.toFixed(0)}ms)`,
+      );
+    }
+  }
+  return rewritten;
+}
+
 /** Create a script filter combining default skipped plugins with optional per-game overrides. */
 export function createScriptPreparer(extraSkipPlugins?: string[]): ScriptFilter {
   const skipped = new Set<string>();
@@ -339,10 +674,43 @@ export function createScriptPreparer(extraSkipPlugins?: string[]): ScriptFilter 
     }
   }
   return (path: string, source: string): string | null => {
-    const base = (path.split('/').pop() || path).toLowerCase();
-    if (skipped.has(base)) return null;
-    const stripped = stripTopLevelUseStrict(source);
+    const rawBase = (path.split('/').pop() || path).toLowerCase();
+    const base = rawBase.replace(/\.omori$/i, '.js');
+    if (skipped.has(base)) {
+      // The Coffin of Andy and Leyley appends its `_();` runtime decrypter bootstrap to the end
+      // of `AudioStreaming.js`. Keep `stbvorbis` AudioStreaming skipped while still invoking `_()`!
+      if (base === 'audiostreaming.js' && /\b_\(\)\s*;?\s*$/.test(source)) {
+        log(`[script] skipped PC-only AudioStreaming body while preserving trailing _() bootstrap: ${path}`);
+        return 'if (typeof _ === "function") _();';
+      }
+      return null;
+    }
+    let stripped = stripTopLevelUseStrict(source);
     if (path.toLowerCase().includes('js/libs/')) return stripped;
+    // Constant-fold javascript-obfuscator string tables (e.g. enc_lv2d.js Live2D Cubism 4 -> >10x faster in jitless V8)
+    stripped = foldObfuscatedStringTable(stripped, path);
+    // Deduplicate & lazily load Yanfly.PreloadedMaps[mapId] in YEP_EventCopier / Morpher / Spawner
+    // (stock Yanfly sets `Yanfly.PreloadedMaps[mapId] = null` before async XHR/fs.readFile, queuing
+    // 250+ duplicate multi-MB map reads, and in OMORI eagerly decrypting 18 Map*.KEL files on boot).
+    if (stripped.includes('Yanfly.PreloadedMaps[mapId]')) {
+      stripped = stripped.replace(
+        /if\s*\(\s*Yanfly\.PreloadedMaps\[mapId\]\s*\)\s*return\s*;/g,
+        'if (Object.prototype.hasOwnProperty.call(Yanfly.PreloadedMaps, mapId) || Yanfly.PreloadedMaps[mapId] !== undefined) return;',
+      );
+      if (stripped.includes('.KEL') && stripped.includes('Encryption.decrypt')) {
+        stripped = stripped.replace(
+          /Yanfly\.PreloadedMaps\[mapId\]\s*=\s*null\s*;\s*fs\.readFile\(\s*base\s*\+\s*"\/data\/"\s*\+\s*filename\s*,\s*\(err,\s*data\)\s*=>\s*\{\s*data\s*=\s*Encryption\.decrypt\(data\)\s*;\s*Yanfly\.PreloadedMaps\[mapId\]\s*=\s*JSON\.parse\(data\.toString\(\)\)\s*;?\s*\}\s*\)\s*;?/g,
+          'Object.defineProperty(Yanfly.PreloadedMaps, mapId, { configurable: true, enumerable: true, get: function() { var p = null; try { var raw = fs.readFileSync(base + "/data/" + filename); p = JSON.parse(Encryption.decrypt(raw).toString()); } catch (_) {} Object.defineProperty(Yanfly.PreloadedMaps, mapId, { value: p, writable: true, configurable: true, enumerable: true }); return p; } });',
+        );
+      }
+    }
+    // Guard YEP_X_MoreQuests against non-JSON separator strings in `Quest N` plugin parameters (e.g. Nightmare Knight)
+    if (stripped.includes('DataManager.questDatabaseCreate') && stripped.includes("JSON.parse(Yanfly.Parameters['Quest ' + i]")) {
+      stripped = stripped.replace(
+        /JSON\.parse\(\s*Yanfly\.Parameters\['Quest '\s*\+\s*i\]\s*\|\|\s*'null'\s*\)/g,
+        "(function(s){try{return JSON.parse(s||'null');}catch(_){return null;}})(Yanfly.Parameters['Quest ' + i])",
+      );
+    }
     return exposeTopLevelLexicals(stripped);
   };
 }
@@ -430,21 +798,31 @@ export interface FontLoadEntry {
 
 /**
  * Detect whether an RPG Maker MV game requires Hardware WebGL2 mode
- * (Live2D Cubism plugins or PixiJS v5+ MV core upgrades using `new PIXI.Renderer`).
+ * (Live2D Cubism plugins, Spine 2D skeletal mesh plugins, or PixiJS v5+ MV core upgrades).
  */
 export function detectMvWebGLReason(
   pluginsJsText: string | null,
   rpgCoreJsText: string | null,
   pixiJsHeadText: string | null,
+  rpgManagersJsText: string | null = null,
 ): string | null {
   if (pluginsJsText && /"name"\s*:\s*"[^"]*(?:live2d|lv2d|cubism)[^"]*"[^}]*"status"\s*:\s*true/i.test(pluginsJsText)) {
     return 'Live2D';
+  }
+  if (pluginsJsText && /"name"\s*:\s*"[^"]*(?:pixi-spine|PictureSpine|Spine)[^"]*"[^}]*"status"\s*:\s*true/i.test(pluginsJsText)) {
+    return 'Spine';
   }
   if (rpgCoreJsText && /\bnew\s+PIXI\.Renderer\s*\(/.test(rpgCoreJsText)) {
     return 'PixiJS v5';
   }
   if (pixiJsHeadText && /pixi\.js\s*-\s*v(?:[5-9]|\d{2,})\./i.test(pixiJsHeadText)) {
     return 'PixiJS v5';
+  }
+  // Games that hard-wire SceneManager.preferableRendererType to 'webgl' (e.g. In Stars And Time) call
+  // checkWebGL() and need real WebGL; the canvas renderer would throw "Your browser does not support WebGL".
+  const forcedWebGL = /preferableRendererType\s*=\s*function\s*\(\s*\)\s*\{\s*return\s*['"]webgl['"]/;
+  if ((rpgManagersJsText && forcedWebGL.test(rpgManagersJsText)) || (pluginsJsText && forcedWebGL.test(pluginsJsText))) {
+    return 'forced WebGL';
   }
   return null;
 }
@@ -532,6 +910,40 @@ const FONT_FILE_RE = /\.(?:ttf|otf|woff2?|ttc)$/i;
 // family so Bitmap.drawText can avoid tofu boxes on nx.js (which has no CSS per-glyph fallback chain).
 const smallLatinFontFamilies = new Set<string>();
 let fullUnicodeFallbackFamily: string | null = null;
+// Kept from registerGameFonts so Graphics.loadFont(name, url) can register extra family names at runtime
+let fontAssetReader: AssetReader | null = null;
+const registeredFontFamilies = new Set<string>();
+
+/**
+ * Runtime `Graphics.loadFont(name, url)`: register the game's font file under the family name the game
+ * asks for (e.g. In Stars And Time loads 'default1' <- fonts/VCR_OSD_MONO_1.001.ttf and draws all text
+ * with fontFace 'default1'). Without it the family is unknown and text falls back to a system font.
+ */
+export function registerFontFamilySync(family: string, url: string): boolean {
+  const fam = String(family || '').trim();
+  if (!fam || registeredFontFamilies.has(fam) || !fontAssetReader) return false;
+  const FontFaceCtor = (globalThis as any).FontFace;
+  const fontSet = (globalThis as any).fonts;
+  if (!FontFaceCtor || !fontSet?.add) return false;
+  let rel = String(url || '').trim();
+  try { rel = decodeURIComponent(rel); } catch { /* keep as is */ }
+  rel = rel.replace(/^\.\//, '').replace(/^\/+/, '');
+  try {
+    const bytes = fontAssetReader.readSync(rel);
+    if (!bytes) {
+      log(`[fonts] loadFont '${fam}': file not found (${rel})`);
+      return false;
+    }
+    fontSet.add(new FontFaceCtor(fam, bytes));
+    registeredFontFamilies.add(fam);
+    if (bytes.byteLength < 250_000) smallLatinFontFamilies.add(fam.toLowerCase());
+    log(`[fonts] loadFont registered '${fam}' <- ${rel}`);
+    return true;
+  } catch (err) {
+    log(`[fonts] loadFont '${fam}' (${rel}) failed: ${String(err)}`);
+    return false;
+  }
+}
 
 /**
  * Automatically discover and register all fonts shipped in the game's `www/fonts/`
@@ -540,6 +952,8 @@ let fullUnicodeFallbackFamily: string | null = null;
 export async function registerGameFonts(assets: AssetReader): Promise<void> {
   smallLatinFontFamilies.clear();
   fullUnicodeFallbackFamily = null;
+  fontAssetReader = assets;
+  registeredFontFamilies.clear();
 
   const FontFaceCtor = (globalThis as any).FontFace;
   const fontSet = (globalThis as any).fonts;
@@ -584,12 +998,13 @@ export async function registerGameFonts(assets: AssetReader): Promise<void> {
       // In nx.js, FontFace loads synchronously in the constructor (face.load() is unimplemented).
       fontSet.add(face);
       registeredFamilies.add(family);
+      registeredFontFamilies.add(family);
       if (bytes.byteLength < 250_000) {
         smallLatinFontFamilies.add(family.toLowerCase());
       } else if (!fullUnicodeFallbackFamily && family !== 'GameFont') {
         fullUnicodeFallbackFamily = family;
       }
-      log(`[fonts] registered '${family}' <- ${file}`);
+      if (family === 'GameFont') gameFontSource = file;
       return true;
     } catch (err) {
       log(`[fonts] failed '${family}' (${file}): ${String(err)}`);
@@ -597,6 +1012,7 @@ export async function registerGameFonts(assets: AssetReader): Promise<void> {
     }
   }
 
+  let gameFontSource: string | null = null;
   let firstLoadedFile: string | null = null;
   let preferredCjkFile: string | null = null;
   let preferredCjkFamily: string | null = null;
@@ -652,6 +1068,12 @@ export async function registerGameFonts(assets: AssetReader): Promise<void> {
       }
     }
   }
+  if (registeredFamilies.size > 0) {
+    log(
+      `[fonts] registered ${registeredFamilies.size} family(s)` +
+      `${gameFontSource ? ` (GameFont <- ${gameFontSource})` : ''}`,
+    );
+  }
 }
 
 /**
@@ -697,21 +1119,25 @@ export function installMvCompat(
 ): void {
   const { Graphics, WebAudio, Utils, SceneManager, Game_Interpreter, PIXI } = runtime;
   const isWebGLMode = Boolean(host?.getWebGLContext?.());
+  syncCanvas2DPluginPrototypes(runtime);
 
-  // 0. In WebGL2/Live2D mode, forward console.error / console.warn (first 40 messages)
-  //    to debug.log so PIXI v4 / Live2D WebGL diagnostics are visible on Switch 2.
-  if (isWebGLMode && runtime.console && !runtime.console.__drMvLogHooked) {
+  // 0. Forward console.error / console.warn (up to 40 distinct messages) to mv.log
+  //    so plugin & PIXI/Live2D diagnostics are captured without per-frame duplicate spam.
+  if (runtime.console && !runtime.console.__drMvLogHooked) {
     runtime.console.__drMvLogHooked = true;
-    let consoleLogCount = 0;
+    const seenConsoleMsgs = new Set<string>();
     for (const level of ['error', 'warn'] as const) {
       const origFn = typeof runtime.console[level] === 'function'
         ? runtime.console[level].bind(runtime.console)
         : null;
       runtime.console[level] = (...args: any[]) => {
-        if (consoleLogCount < 40) {
-          consoleLogCount++;
-          const txt = args.map((a) => (a instanceof Error ? a.stack || a.message : String(a))).join(' ');
-          log(`[console.${level}] ${txt.slice(0, 600)}`);
+        if (seenConsoleMsgs.size < 40) {
+          const txt = args.map((a) => (a instanceof Error ? a.stack || a.message : String(a))).join(' ').slice(0, 600);
+          const key = `${level}:${txt}`;
+          if (txt && !seenConsoleMsgs.has(key)) {
+            seenConsoleMsgs.add(key);
+            log(`[console.${level}] ${txt}`);
+          }
         }
         origFn?.(...args);
       };
@@ -742,7 +1168,9 @@ export function installMvCompat(
   }
   if (Graphics) {
     Graphics.isFontLoaded = () => true;
-    Graphics.loadFont = () => {};
+    Graphics.loadFont = (name: string, url: string) => {
+      registerFontFamilySync(name, url);
+    };
     Graphics._createErrorPrinter = () => {};
     Graphics._updateErrorPrinter = () => {};
     Graphics.printError = (name: string, message: string) => {
@@ -1113,6 +1541,40 @@ export function installMvCompat(
                 return origBindTexture(texture, location, forceLocation);
               };
             }
+            // PIXI v4's sprite batcher never calls bindTexture for a texture it believes is already in
+            // `renderer.boundTextures` (it reuses the slot via `_virtalBoundId`). After Live2D Cubism has
+            // bound its own textures to units 0/1, windows and sprites cached in those slots sampled the
+            // Live2D texture instead (white message boxes / white rectangles over sprites in Lilialette's
+            // Hustle). Before every batch flush, drop any cached slot whose texture is no longer the one
+            // actually bound in GL, and forget the cached blend mode, so PIXI rebinds what it needs.
+            const spriteRenderer = r.plugins?.sprite;
+            if (spriteRenderer && typeof spriteRenderer.flush === 'function' && !spriteRenderer.__drSlotSync) {
+              spriteRenderer.__drSlotSync = true;
+              const origFlush = spriteRenderer.flush;
+              const uid = r.CONTEXT_UID;
+              spriteRenderer.flush = function (this: any) {
+                const bt = r.boundTextures;
+                const empty = r.emptyTextures;
+                if (bt && empty) {
+                  for (let slot = 0; slot < bt.length; slot++) {
+                    const cached = bt[slot];
+                    if (!cached || cached === empty[slot]) continue;
+                    const gt = cached._glTextures?.[uid]?.texture;
+                    if (!gt || rgl.__drBoundTex2D(slot) !== gt) {
+                      bt[slot] = empty[slot];
+                    }
+                  }
+                }
+                const st = r.state;
+                if (st && rgl.__drBoundProgram() !== r._activeShader?.program) {
+                  // Another GL user ran since PIXI last drew: its blend func may be active.
+                  // PIXI v4 caches it in activeState[4] (BLEND_FUNC); v5-style ports in `blendMode`.
+                  if (st.activeState && st.activeState.length > 4) st.activeState[4] = -1;
+                  if ('blendMode' in st) st.blendMode = -1;
+                }
+                return origFlush.apply(this, arguments);
+              };
+            }
           }
           log(`[compat] MV renderer created: ${r?.constructor?.name ?? 'null'} (type=${r?.type ?? '?'}, gl=${Boolean(r?.gl)})`);
         }
@@ -1143,10 +1605,171 @@ export function installMvCompat(
   }
 
   // 3. WebAudio: select format supported by this game's audio/ folder (native FFmpeg decodes both)
+  //    AND install an in-memory decoded AudioBuffer LRU cache + in-flight request coalescer!
+  //    Stock RPG Maker MV re-reads `.ogg`/`.rpgmvo` from SD via XHR and runs FFmpeg `decodeAudioData`
+  //    from scratch on EVERY `AudioManager.playSe()` call (footsteps in Fear & Hunger, cursor moves,
+  //    and 5-20 simultaneous SEs during battle animations!). Caching decoded buffers <= 15s (up to
+  //    96 MB PCM) makes repeat SE/ME/voice playback 0.0 ms instant with zero SD I/O or decode stalls.
   if (WebAudio) {
     const support = options?.audioSupport ?? { canOgg: true, canM4a: false };
     WebAudio.canPlayOgg = () => support.canOgg;
     WebAudio.canPlayM4a = () => support.canM4a;
+
+    const WebAudioProto = WebAudio.prototype;
+    if (
+      WebAudioProto &&
+      typeof WebAudioProto._load === 'function' &&
+      typeof WebAudioProto._onXhrLoad === 'function' &&
+      !WebAudioProto.__drAudioCache
+    ) {
+      const loadSrc = String(WebAudioProto._load);
+      const onXhrSrc = String(WebAudioProto._onXhrLoad);
+      if (loadSrc.includes('XMLHttpRequest') && onXhrSrc.includes('decodeAudioData')) {
+        WebAudioProto.__drAudioCache = true;
+        type CachedAudioEntry = {
+          buffer: any;
+          totalTime: number;
+          sampleRate: number;
+          loopStart: number;
+          loopLength: number;
+          bytes: number;
+        };
+        const MAX_AUDIO_CACHE_BYTES = 96 * 1024 * 1024;
+        const MAX_CACHE_DURATION_SEC = 15;
+        const audioCache = new Map<string, CachedAudioEntry>();
+        const inflightAudio = new Map<string, Array<(entry: CachedAudioEntry | null) => void>>();
+        let audioCacheBytes = 0;
+
+        const putAudioCache = (key: string, entry: CachedAudioEntry) => {
+          if (entry.totalTime <= 0 || entry.totalTime > MAX_CACHE_DURATION_SEC || entry.bytes > 16 * 1024 * 1024) {
+            return;
+          }
+          if (audioCache.has(key)) {
+            const old = audioCache.get(key)!;
+            audioCacheBytes -= old.bytes;
+            audioCache.delete(key);
+          }
+          while (audioCacheBytes + entry.bytes > MAX_AUDIO_CACHE_BYTES && audioCache.size > 0) {
+            const oldestKey = audioCache.keys().next().value;
+            if (oldestKey === undefined) break;
+            const oldest = audioCache.get(oldestKey)!;
+            audioCacheBytes -= oldest.bytes;
+            audioCache.delete(oldestKey);
+          }
+          audioCache.set(key, entry);
+          audioCacheBytes += entry.bytes;
+        };
+
+        const applyAudioEntry = (inst: any, entry: CachedAudioEntry, syncReady: boolean) => {
+          inst._buffer = entry.buffer;
+          inst._totalTime = entry.totalTime;
+          inst._sampleRate = entry.sampleRate;
+          inst._loopStart = entry.loopStart;
+          inst._loopLength = entry.loopLength;
+          if (syncReady) {
+            Promise.resolve().then(() => {
+              if (inst._buffer && inst._loadListeners?.length > 0) {
+                inst._onLoad?.();
+              }
+            });
+          } else {
+            inst._onLoad?.();
+          }
+        };
+
+        const origLoad = WebAudioProto._load;
+        WebAudioProto._load = function (url: string) {
+          if (!WebAudio._context || !url) return origLoad.call(this, url);
+          const Dec = runtime.Decrypter;
+          const realUrl = Dec?.hasEncryptedAudio && typeof Dec.extToEncryptExt === 'function'
+            ? Dec.extToEncryptExt(url)
+            : url;
+          const cached = audioCache.get(realUrl);
+          if (cached) {
+            // Refresh LRU order
+            audioCache.delete(realUrl);
+            audioCache.set(realUrl, cached);
+            applyAudioEntry(this, cached, true);
+            return;
+          }
+          const waiters = inflightAudio.get(realUrl);
+          if (waiters) {
+            waiters.push((entry) => {
+              if (entry) applyAudioEntry(this, entry, false);
+              else {
+                this._hasError = true;
+                this._loader?.();
+              }
+            });
+            return;
+          }
+          const queue: Array<(entry: CachedAudioEntry | null) => void> = [];
+          inflightAudio.set(realUrl, queue);
+
+          const XHR = (globalThis as any).XMLHttpRequest;
+          const xhr = new XHR();
+          xhr.open('GET', realUrl);
+          xhr.responseType = 'arraybuffer';
+          xhr.onload = () => {
+            if (xhr.status < 400 && xhr.response) {
+              let array = xhr.response;
+              try {
+                if (Dec?.hasEncryptedAudio && typeof Dec.decryptArrayBuffer === 'function') {
+                  array = Dec.decryptArrayBuffer(array);
+                }
+                this._readLoopComments?.(new Uint8Array(array));
+              } catch { /* ignore header parse errors */ }
+              const rawSampleRate = this._sampleRate || 0;
+              const rawLoopStart = this._loopStart || 0;
+              const rawLoopLen = this._loopLength || 0;
+              WebAudio._context.decodeAudioData(
+                array,
+                (buffer: any) => {
+                  const totalTime = Number(buffer?.duration) || 0;
+                  let loopStart = 0;
+                  let loopLength = totalTime;
+                  if (rawLoopLen > 0 && rawSampleRate > 0) {
+                    loopStart = rawLoopStart / rawSampleRate;
+                    loopLength = rawLoopLen / rawSampleRate;
+                  }
+                  const ch = Number(buffer?.numberOfChannels) || 2;
+                  const len = Number(buffer?.length) || Math.ceil(totalTime * 44100);
+                  const entry: CachedAudioEntry = {
+                    buffer,
+                    totalTime,
+                    sampleRate: rawSampleRate,
+                    loopStart,
+                    loopLength,
+                    bytes: ch * len * 4,
+                  };
+                  putAudioCache(realUrl, entry);
+                  inflightAudio.delete(realUrl);
+                  applyAudioEntry(this, entry, false);
+                  for (let i = 0; i < queue.length; i++) queue[i](entry);
+                },
+                () => {
+                  inflightAudio.delete(realUrl);
+                  this._hasError = true;
+                  for (let i = 0; i < queue.length; i++) queue[i](null);
+                },
+              );
+            } else {
+              inflightAudio.delete(realUrl);
+              this._hasError = true;
+              for (let i = 0; i < queue.length; i++) queue[i](null);
+            }
+          };
+          xhr.onerror = () => {
+            inflightAudio.delete(realUrl);
+            if (typeof this._loader === 'function') this._loader();
+            else this._hasError = true;
+            for (let i = 0; i < queue.length; i++) queue[i](null);
+          };
+          xhr.send();
+        };
+        log('[audio] WebAudio decoded SE/ME buffer LRU cache (96 MB) & request coalescing enabled');
+      }
+    }
   }
 
   // 4. Hook `111_InputForm` plugin command to Switch 2's native Software Keyboard (swkbd)
@@ -1226,7 +1849,11 @@ export function installMvCompat(
       }
       const willRender = this._skipCount <= 0;
       const t0 = performance.now();
-      if (willRender) host.beginFrame();
+      if (willRender) {
+        // One count per presented frame (Graphics.frameCount counts logic ticks, ~2 per frame at 30 fps)
+        runtime.__drRenderFrame = (runtime.__drRenderFrame | 0) + 1;
+        host.beginFrame();
+      }
       let out: any;
       try {
         out = origRender.call(this, stage);
@@ -1335,14 +1962,87 @@ export function installMvCompat(
     // background is ever displayed, and allocating a fresh full-screen canvas / RenderTexture +
     // framebuffer per snapshot was the bulk of the 70-230ms menu-open snapshot cost.
     let snapCache: { mode: '2d' | 'rt'; w: number; h: number; bitmap: any; rt?: any } | null = null;
+    let lastSnapFrame = -1;
+    let lastSnapStage: any = null;
+    let lastSnapBitmap: any = null;
     let snapLogCount = 0;
-    const snapLog = (msg: string) => {
-      if (snapLogCount < 8) {
+    const snapLog = (msg: string, isWarn = false) => {
+      if (isWarn && snapLogCount < 4) {
         snapLogCount++;
         log(`[snap] ${msg}`);
       }
     };
+    // A zero-copy snapshot Bitmap samples a GPU RenderTexture, so its own 2D canvas is blank and its
+    // texture has no image source. Games and plugins may still draw on it (menu-background darkening,
+    // custom blur, thumbnails): the first touch of its 2D context reads the RenderTexture back into the
+    // canvas once and restores the Bitmap's own canvas texture, turning it into an ordinary snapshot.
+    // Until then a dirty flag must not reach RenderTexture.baseTexture.update(), which reads
+    // `source.naturalWidth` from a null source ("Cannot read properties of null (reading 'naturalWidth')").
+    const makeRtBitmapCanvasSafe = (bitmap: any, rt: any, canvasBase: any) => {
+      const rtBase = rt.baseTexture;
+      const ctx = bitmap._context;
+      if (!ctx || !canvasBase) return;
+      let materialized = false;
+      const materialize = () => {
+        if (materialized) return;
+        materialized = true;
+        let pixels: any = null;
+        try {
+          if (!rtBase?.destroyed) pixels = Graphics._renderer?.extract?.canvas?.(rt);
+        } catch (err) {
+          snapLog(`zero-copy readback failed: ${String(err)}`);
+        }
+        delete bitmap._context;
+        bitmap._context = ctx;
+        try { delete bitmap.baseTexture; } catch { /* ignore */ }
+        try { delete bitmap._baseTexture; } catch { /* ignore */ }
+        try { bitmap._baseTexture = canvasBase; } catch { /* getter-only: own prop already removed */ }
+        delete bitmap.checkDirty;
+        if (pixels) {
+          ctx.save?.();
+          ctx.globalCompositeOperation = 'copy';
+          ctx.globalAlpha = 1;
+          ctx.drawImage(pixels, 0, 0, bitmap.width || pixels.width, bitmap.height || pixels.height);
+          ctx.restore?.();
+        }
+        bitmap._setDirty?.();
+        // This Bitmap now owns its pixels: never hand it out again as the reusable snapshot target.
+        const cached = snapCache;
+        if (cached && cached.bitmap === bitmap) {
+          try { cached.rt?.destroy?.(true); } catch { /* ignore */ }
+          snapCache = null;
+        }
+        if (lastSnapBitmap === bitmap) lastSnapBitmap = null;
+        snapLog('zero-copy snapshot drawn on by the game -> converted to canvas bitmap');
+      };
+      Object.defineProperty(bitmap, '_context', {
+        configurable: true,
+        enumerable: true,
+        get() { materialize(); return ctx; },
+        set(v) { materialize(); delete bitmap._context; bitmap._context = v; },
+      });
+      const protoCheckDirty = Object.getPrototypeOf(bitmap)?.checkDirty;
+      bitmap.checkDirty = function (this: any, ...args: any[]) {
+        if (!materialized && this.baseTexture === rtBase) {
+          this._dirty = false;
+          return undefined;
+        }
+        return protoCheckDirty?.apply(this, args);
+      };
+    };
     BitmapClass.snap = function (stage: any) {
+      const fc = typeof Graphics?.frameCount === 'number' ? Graphics.frameCount : -2;
+      if (fc >= 0 && fc === lastSnapFrame && stage && stage === lastSnapStage && lastSnapBitmap && !lastSnapBitmap._destroyed) {
+        return lastSnapBitmap;
+      }
+      const remember = (bmp: any) => {
+        if (fc >= 0 && stage && bmp) {
+          lastSnapFrame = fc;
+          lastSnapStage = stage;
+          lastSnapBitmap = bmp;
+        }
+        return bmp;
+      };
       const gw = Graphics?.width || 816;
       const gh = Graphics?.height || 624;
       // 2D directGPU mode: copy the already-rendered screen surface directly in 1 GPU blit (<1ms)
@@ -1372,7 +2072,7 @@ export function installMvCompat(
               ctx.restore?.();
               c.bitmap._setDirty?.();
               snapLog(`2d screen copy: alloc=${(t1 - t0).toFixed(1)}ms copy=${(performance.now() - t1).toFixed(1)}ms reused=${reused}`);
-              return c.bitmap;
+              return remember(c.bitmap);
             }
           } catch (err) {
             snapLog(`2d screen copy failed: ${String(err)}`);
@@ -1382,6 +2082,12 @@ export function installMvCompat(
       // WebGL2 mode: render into a half-resolution RenderTexture so gl.readPixels reads 4x fewer bytes
       // (cuts menu-open GPU pipeline stall dramatically while looking clean behind menus).
       if (isWebGLMode && stage && Graphics?._renderer && PIXI?.RenderTexture?.create) {
+        // PixiJS v4 (`PIXI.RenderTexture.create(w, h)`) takes positional numbers, whereas PixiJS v5
+        // accepts `{ width, height }`. Passing an object in PixiJS v4 sets `baseTexture.width = [object Object]`!
+        const createPixiRt = (w: number, h: number) =>
+          (!PIXI.BatchRenderer || String(PIXI.VERSION || '').startsWith('4.'))
+            ? PIXI.RenderTexture.create(w, h)
+            : PIXI.RenderTexture.create({ width: w, height: h });
         // Zero-readback path: render the scene into a GPU RenderTexture and let the background Bitmap
         // sample it directly (no gl.readPixels pipeline stall, no canvas copy, no re-upload).
         try {
@@ -1392,7 +2098,7 @@ export function installMvCompat(
             c.bitmap && c.bitmap.baseTexture === c.rt.baseTexture,
           );
           if (!reused) {
-            const rt = PIXI.RenderTexture.create({ width: gw, height: gh });
+            const rt = createPixiRt(gw, gh);
             const bitmap = new BitmapClass(gw, gh);
             const base = rt.baseTexture;
             const prevBase = bitmap._baseTexture;
@@ -1411,6 +2117,7 @@ export function installMvCompat(
             }
             if (bitmap.baseTexture === base) {
               try { if (snapCache?.rt) snapCache.rt.destroy?.(true); } catch { /* ignore */ }
+              makeRtBitmapCanvasSafe(bitmap, rt, prevBase);
               c = snapCache = { mode: 'rt', w: gw, h: gh, bitmap, rt };
             } else {
               try { bitmap._baseTexture = prevBase; } catch { /* ignore */ }
@@ -1425,7 +2132,7 @@ export function installMvCompat(
             snapLog(
               `webgl zero-copy: alloc=${(t1 - t0).toFixed(1)}ms render=${(performance.now() - t1).toFixed(1)}ms reused=${reused}`,
             );
-            return c.bitmap;
+            return remember(c.bitmap);
           }
         } catch (err) {
           snapLog(`webgl zero-copy failed: ${String(err)}`);
@@ -1433,7 +2140,7 @@ export function installMvCompat(
         try {
           const hw = Math.max(1, gw >> 1);
           const hh = Math.max(1, gh >> 1);
-          const rt = PIXI.RenderTexture.create({ width: hw, height: hh });
+          const rt = createPixiRt(hw, hh);
           const prevSx = stage.scale?.x ?? 1;
           const prevSy = stage.scale?.y ?? 1;
           if (stage.scale) stage.scale.set(prevSx * (hw / gw), prevSy * (hh / gh));
@@ -1449,11 +2156,11 @@ export function installMvCompat(
             const bitmap = new BitmapClass(gw, gh);
             bitmap._context?.drawImage?.(extracted, 0, 0, extracted.width || hw, extracted.height || hh, 0, 0, gw, gh);
             bitmap._setDirty?.();
-            return bitmap;
+            return remember(bitmap);
           }
         } catch { /* fall through to origSnap */ }
       }
-      return origSnap.call(this, stage);
+      return remember(origSnap.call(this, stage));
     };
   }
   // 6d00. Menu spritesets (e.g. MenuCommonEvent.js's Spriteset_Menu, created on every menu open) build
@@ -1529,7 +2236,32 @@ export function installMvCompat(
   const ImageCacheClass = runtime.ImageCache;
   if (ImageCacheClass && typeof ImageCacheClass.limit === 'number' && ImageCacheClass.limit < 40 * 1000 * 1000) {
     ImageCacheClass.limit = 40 * 1000 * 1000;
-    log('[compat] ImageCache limit raised to 40 MP');
+  }
+  // Aetherflow_PreloadEverything (used by OMORI):
+  // 1. Raise ImageCacheSize from 10 MB (2.5 MP) so 4096x4096 atlases & map tilesets don't constantly evict.
+  // 2. Skip pre-decoding unused full-length BGM/BGS tracks into uncompressed Float32 PCM during Scene_Boot
+  //    and Scene_Map.onMapLoaded (saves ~25s on OMORI boot, ~800ms per map load, and ~350 MB RAM).
+  const aether = runtime.Aetherflow;
+  if (aether?.Preload && !aether.__drFastPreload) {
+    aether.__drFastPreload = true;
+    if (aether.Param && typeof aether.Param.ImageCacheSize === 'number' && aether.Param.ImageCacheSize < 160 * 1000 * 1000) {
+      aether.Param.ImageCacheSize = 160 * 1000 * 1000;
+    }
+    if (ImageCacheClass && typeof ImageCacheClass.maxSize === 'number' && ImageCacheClass.maxSize < 160 * 1000 * 1000) {
+      ImageCacheClass.maxSize = 160 * 1000 * 1000;
+    }
+    const AM = runtime.AudioManager;
+    if (AM && typeof AM.reserveAudio === 'function' && !AM.__drSkipBgmPreload) {
+      AM.__drSkipBgmPreload = true;
+      const origReserveAudio = AM.reserveAudio;
+      AM.reserveAudio = function (folder: string, filename: string, reservationId?: any) {
+        const f = String(folder || '').toLowerCase();
+        if (f.startsWith('bgm') || f.startsWith('bgs') || f.startsWith('me')) {
+          return null;
+        }
+        return origReserveAudio.call(this, folder, filename, reservationId);
+      };
+    }
   }
   if (SceneManager?.snapForBackground) {
     SceneManager.snapForBackground = function () {
@@ -1579,9 +2311,37 @@ export function installMvCompat(
     }
     if (typeof BitmapClass.prototype.measureTextWidth === 'function') {
       const origMeasure = BitmapClass.prototype.measureTextWidth;
+      const textWidthCache = new Map<string, number>();
+      const MAX_TEXT_WIDTH_CACHE = 8192;
       BitmapClass.prototype.measureTextWidth = function (text: any) {
         const clean = normalizeDrawText(text);
-        if (needsFallback(this, clean)) {
+        const s = clean == null ? '' : String(clean);
+        if (!s) return 0;
+        const useFallback = needsFallback(this, clean);
+        const effFace = useFallback ? cjkFam : this.fontFace;
+        if (s.length <= 64) {
+          const cacheKey = `${effFace}|${this.fontSize}|${this.fontItalic ? 1 : 0}|${this.fontBold ? 1 : 0}|${s}`;
+          const hit = textWidthCache.get(cacheKey);
+          if (hit !== undefined) return hit;
+          let measured: number;
+          if (useFallback) {
+            const prev = this.fontFace;
+            this.fontFace = cjkFam;
+            try {
+              measured = origMeasure.call(this, clean);
+            } finally {
+              this.fontFace = prev;
+            }
+          } else {
+            measured = origMeasure.call(this, clean);
+          }
+          if (typeof measured === 'number' && !Number.isNaN(measured)) {
+            if (textWidthCache.size >= MAX_TEXT_WIDTH_CACHE) textWidthCache.clear();
+            textWidthCache.set(cacheKey, measured);
+          }
+          return measured;
+        }
+        if (useFallback) {
           const prev = this.fontFace;
           this.fontFace = cjkFam;
           try {
@@ -1720,10 +2480,59 @@ export function installMvCompat(
   }
 
   // 6e. Fast CanvasRenderer culling for invisible, empty-frame (0x0), or off-screen sprites
-  //     using dynamic Graphics.width / Graphics.height bounds, plus zero-copy _executeTint.
+  //     using dynamic Graphics.width / Graphics.height bounds, plus zero-realloc _createTinter,
+  //     flash-alpha quantization, memoized _executeTint, and Sprite_Animation cell pooling/prewarm.
   const SpriteProto = runtime.Sprite?.prototype;
+  if (SpriteProto && typeof SpriteProto._createTinter === 'function' && !SpriteProto.__drNoReallocTinter) {
+    const ctSrc = String(SpriteProto._createTinter);
+    if (ctSrc.includes('_canvas') && ctSrc.includes('_tintTexture') && ctSrc.length < 520) {
+      SpriteProto.__drNoReallocTinter = true;
+      SpriteProto._createTinter = function (w: number, h: number) {
+        if (!this._canvas) {
+          this._canvas = runtime.document.createElement('canvas');
+          this._context = this._canvas.getContext('2d');
+        }
+        if (this._canvas.width !== w || this._canvas.height !== h) {
+          this._canvas.width = w;
+          this._canvas.height = h;
+          this._drTintKey = '';
+        }
+        if (!this._tintTexture && PIXI?.BaseTexture) {
+          this._tintTexture = new PIXI.BaseTexture(this._canvas);
+        }
+        if (this._tintTexture) {
+          this._tintTexture.width = w;
+          this._tintTexture.height = h;
+          if (this._bitmap?.baseTexture) {
+            this._tintTexture.scaleMode = this._bitmap.baseTexture.scaleMode;
+          }
+        }
+      };
+    }
+  }
+  if (SpriteProto && typeof SpriteProto.setBlendColor === 'function' && !SpriteProto.__drQuantBlend) {
+    const sbSrc = String(SpriteProto.setBlendColor);
+    if (sbSrc.includes('_blendColor') && sbSrc.includes('_refresh') && sbSrc.length < 320) {
+      SpriteProto.__drQuantBlend = true;
+      SpriteProto.setBlendColor = function (color: number[]) {
+        if (!Array.isArray(color)) throw new Error('Argument must be an array');
+        const r = color[0] | 0;
+        const g = color[1] | 0;
+        const b = color[2] | 0;
+        const rawA = Number(color[3]) || 0;
+        // Quantize decaying hit-flash alpha into 16-unit steps (preserving exact 0 and 255)
+        // so 30-60 frame animation/damage flashes don't re-rasterize & re-upload battler canvases every frame!
+        const qA = rawA <= 2 ? 0 : rawA >= 250 ? 255 : ((rawA + 8) & ~15);
+        const cur = this._blendColor;
+        if (cur && cur[0] === r && cur[1] === g && cur[2] === b && cur[3] === qA) return;
+        this._blendColor = [r, g, b, qA];
+        this._refresh();
+      };
+    }
+  }
   if (SpriteProto && typeof SpriteProto._executeTint === 'function' && !SpriteProto.__drFastTint) {
     SpriteProto.__drFastTint = true;
+    const origExecuteTint = SpriteProto._executeTint;
     SpriteProto._executeTint = function (x: number, y: number, w: number, h: number) {
       const context = this._context;
       const bmp = this._bitmap;
@@ -1731,64 +2540,14 @@ export function installMvCompat(
       if (!context || !src || w <= 0 || h <= 0) return;
       const tone = this._colorTone;
       const color = this._blendColor;
-      const UtilsObj = runtime.Utils;
-      const rgbToCss = (r: number, g: number, b: number) =>
-        typeof UtilsObj?.rgbToCssColor === 'function'
-          ? UtilsObj.rgbToCssColor(r, g, b)
-          : `rgb(${r | 0},${g | 0},${b | 0})`;
-
-      context.globalCompositeOperation = 'copy';
-      context.globalAlpha = 1;
-      context.drawImage(src, x, y, w, h, 0, 0, w, h);
-
-      if (tone[3] > 0 && Graphics?.canUseSaturationBlend?.()) {
-        const gray = Math.max(0, tone[3]);
-        context.globalCompositeOperation = 'saturation';
-        context.fillStyle = `rgba(255,255,255,${gray / 255})`;
-        context.fillRect(0, 0, w, h);
+      if (Array.isArray(tone) && Array.isArray(color)) {
+        const bmpRev = bmp?._canvas?.revision ?? (bmp?._dirty ? 1 : 0);
+        const tintKey = `${x},${y},${w},${h}|${tone[0]},${tone[1]},${tone[2]},${tone[3]}|${color[0]},${color[1]},${color[2]},${color[3]}|${bmpRev}`;
+        if (this._drTintSrc === src && this._drTintKey === tintKey) return;
+        this._drTintSrc = src;
+        this._drTintKey = tintKey;
       }
-
-      const r1 = Math.max(0, tone[0]);
-      const g1 = Math.max(0, tone[1]);
-      const b1 = Math.max(0, tone[2]);
-      if (r1 > 0 || g1 > 0 || b1 > 0) {
-        context.globalCompositeOperation = 'lighter';
-        context.fillStyle = rgbToCss(r1, g1, b1);
-        context.fillRect(0, 0, w, h);
-      }
-
-      const r2 = Math.max(0, -tone[0]);
-      const g2 = Math.max(0, -tone[1]);
-      const b2 = Math.max(0, -tone[2]);
-      if ((r2 > 0 || g2 > 0 || b2 > 0) && Graphics?.canUseDifferenceBlend?.()) {
-        context.globalCompositeOperation = 'difference';
-        context.fillStyle = 'white';
-        context.fillRect(0, 0, w, h);
-
-        context.globalCompositeOperation = 'lighter';
-        context.fillStyle = rgbToCss(r2, g2, b2);
-        context.fillRect(0, 0, w, h);
-
-        context.globalCompositeOperation = 'difference';
-        context.fillStyle = 'white';
-        context.fillRect(0, 0, w, h);
-      }
-
-      const r3 = Math.max(0, color[0]);
-      const g3 = Math.max(0, color[1]);
-      const b3 = Math.max(0, color[2]);
-      const a3 = Math.max(0, color[3]);
-      if (a3 > 0) {
-        context.globalCompositeOperation = 'source-atop';
-        context.fillStyle = rgbToCss(r3, g3, b3);
-        context.globalAlpha = a3 / 255;
-        context.fillRect(0, 0, w, h);
-      }
-
-      context.globalCompositeOperation = 'destination-in';
-      context.globalAlpha = 1;
-      context.drawImage(src, x, y, w, h, 0, 0, w, h);
-      context.globalCompositeOperation = 'source-over';
+      return origExecuteTint.call(this, x, y, w, h);
     };
   }
   if (SpriteProto?._renderCanvas && !SpriteProto.__drSpriteSkip) {
@@ -1818,6 +2577,87 @@ export function installMvCompat(
     };
   }
 
+  // 6e1b. Sprite_Animation cell-sprite pooling + eager animation sheet preloading on requestAnimation /
+  //       startAnimation so battle & map animations start without cold PNG decode stalls or 16-Sprite GC churn.
+  const SpriteAnimProto = runtime.Sprite_Animation?.prototype;
+  const SpriteCtor = runtime.Sprite;
+  if (SpriteAnimProto && typeof SpriteCtor === 'function' && !SpriteAnimProto.__drAnimPool) {
+    SpriteAnimProto.__drAnimPool = true;
+    const cellPool: any[] = [];
+    const MAX_CELL_POOL = 96;
+    if (
+      typeof SpriteAnimProto.createCellSprites === 'function' &&
+      String(SpriteAnimProto.createCellSprites).includes('_cellSprites') &&
+      String(SpriteAnimProto.createCellSprites).length < 360
+    ) {
+      SpriteAnimProto.createCellSprites = function () {
+        this._cellSprites = [];
+        for (let i = 0; i < 16; i++) {
+          let sp = cellPool.pop();
+          if (!sp || sp._destroyed) {
+            sp = new SpriteCtor();
+          } else {
+            sp.bitmap = null;
+            sp.rotation = 0;
+            sp.scale.x = 1;
+            sp.scale.y = 1;
+            sp.opacity = 255;
+            sp.blendMode = 0;
+          }
+          sp.anchor.x = 0.5;
+          sp.anchor.y = 0.5;
+          sp.visible = false;
+          this._cellSprites.push(sp);
+          this.addChild(sp);
+        }
+      };
+    }
+    if (typeof SpriteAnimProto.remove === 'function') {
+      const origAnimRemove = SpriteAnimProto.remove;
+      SpriteAnimProto.remove = function () {
+        const cells = this._cellSprites;
+        const res = origAnimRemove.apply(this, arguments);
+        if (Array.isArray(cells)) {
+          for (let i = 0; i < cells.length; i++) {
+            const sp = cells[i];
+            if (sp && !sp._destroyed && cellPool.length < MAX_CELL_POOL) {
+              try { sp.parent?.removeChild?.(sp); } catch { /* ignore */ }
+              sp.bitmap = null;
+              sp.visible = false;
+              cellPool.push(sp);
+            }
+          }
+        }
+        return res;
+      };
+    }
+    const prewarmAnimId = (animId: number) => {
+      const anim = runtime.$dataAnimations?.[animId];
+      const IM = runtime.ImageManager;
+      if (!anim || !IM || typeof IM.loadAnimation !== 'function') return;
+      if (anim.animation1Name) IM.loadAnimation(anim.animation1Name, anim.animation1Hue || 0);
+      if (anim.animation2Name) IM.loadAnimation(anim.animation2Name, anim.animation2Hue || 0);
+    };
+    const GameTempP = runtime.Game_Temp?.prototype;
+    if (GameTempP && typeof GameTempP.requestAnimation === 'function' && !GameTempP.__drAnimPrewarm) {
+      GameTempP.__drAnimPrewarm = true;
+      const origReqAnim = GameTempP.requestAnimation;
+      GameTempP.requestAnimation = function (_targets: any, animationId: number) {
+        try { prewarmAnimId(animationId); } catch { /* ignore */ }
+        return origReqAnim.apply(this, arguments);
+      };
+    }
+    const GameBattlerP = runtime.Game_Battler?.prototype;
+    if (GameBattlerP && typeof GameBattlerP.startAnimation === 'function' && !GameBattlerP.__drAnimPrewarm) {
+      GameBattlerP.__drAnimPrewarm = true;
+      const origStartAnim = GameBattlerP.startAnimation;
+      GameBattlerP.startAnimation = function (animationId: number) {
+        try { prewarmAnimId(animationId); } catch { /* ignore */ }
+        return origStartAnim.apply(this, arguments);
+      };
+    }
+  }
+
   // 6e2. Tilemap fast-paths (_sortChildren, resolution-independent toroidal _paintTiles cache,
   //      and MPP_MapLight darkness skip):
   const TilemapProto = runtime.Tilemap?.prototype;
@@ -1825,25 +2665,34 @@ export function installMvCompat(
     TilemapProto.__drFastSort = true;
     if (TilemapProto._sortChildren) {
       const compareTilemapChild = (a: any, b: any) => {
-        if (a.z !== b.z) return a.z - b.z;
-        if (a.y !== b.y) return a.y - b.y;
-        return a.spriteId - b.spriteId;
+        const az = a.z || 0;
+        const bz = b.z || 0;
+        if (az !== bz) return az - bz;
+        const ay = a.y || 0;
+        const by = b.y || 0;
+        if (ay !== by) return ay - by;
+        return (a.spriteId || 0) - (b.spriteId || 0);
       };
       TilemapProto._sortChildren = function () {
         const ch = this.children;
         const len = ch.length;
         if (len <= 1) return;
         let prev = ch[0];
+        let pz = prev.z || 0;
+        let py = prev.y || 0;
+        let ps = prev.spriteId || 0;
         for (let i = 1; i < len; i++) {
           const cur = ch[i];
-          if (
-            prev.z > cur.z ||
-            (prev.z === cur.z && (prev.y > cur.y || (prev.y === cur.y && prev.spriteId > cur.spriteId)))
-          ) {
+          const cz = cur.z || 0;
+          const cy = cur.y || 0;
+          const cs = cur.spriteId || 0;
+          if (pz > cz || (pz === cz && (py > cy || (py === cy && ps > cs)))) {
             ch.sort(compareTilemapChild);
             return;
           }
-          prev = cur;
+          pz = cz;
+          py = cy;
+          ps = cs;
         }
       };
     }
@@ -1982,6 +2831,176 @@ export function installMvCompat(
         }
         return origUpdateTouch.call(this);
       };
+    }
+  }
+  // PictureSpine.js attaches a Sprite_Spine child to all 100 Sprite_Picture slots; fast-skip idle slots.
+  const SpriteSpineProto = runtime.Sprite_Spine?.prototype;
+  if (SpriteSpineProto?.update && !SpriteSpineProto.__drIdleSpineSkip) {
+    SpriteSpineProto.__drIdleSpineSkip = true;
+    const origSpineUpdate = SpriteSpineProto.update;
+    SpriteSpineProto.update = function () {
+      if (!this._spine && !this._skeleton && !this._data) {
+        const pic = runtime.$gameScreen?.picture?.(this._pictureId);
+        if (!pic || !pic._spine) return;
+      }
+      return origSpineUpdate.call(this);
+    };
+  }
+  // Live2D Cubism 4 (`enc_lv2d.js` / `live2dCubism4RuntimeForMV.js`):
+  // Stock `CubismRenderer_WebGL` shares ONE `_bufferData` trio across all 50-160 drawables, calling
+  // `gl.bufferData(..., DYNAMIC_DRAW)` 3 times per mesh (~165 `VkBuffer` re-allocations/frame in Zink!).
+  // Pooling a dedicated `{ vertex, uv, index }` VBO trio per drawable lets `uv` and `index` upload ONCE
+  // for the lifetime of the model and updates `vertex` via a single in-place `gl.bufferSubData` per frame.
+  const cubismRendererProto = runtime.Live2DCubismFramework?.CubismRenderer_WebGL?.prototype;
+  if (cubismRendererProto && typeof cubismRendererProto.drawMesh === 'function' && !cubismRendererProto.__drVboPool) {
+    cubismRendererProto.__drVboPool = true;
+    const origDrawMesh = cubismRendererProto.drawMesh;
+    cubismRendererProto.drawMesh = function (
+      texNo: number,
+      idxCount: number,
+      vertCount: number,
+      idxArr: any,
+      vertArr: any,
+      uvArr: any,
+      opacity: number,
+      blendMode: number,
+      invMask: boolean,
+    ) {
+      if (uvArr && idxArr && vertArr && typeof uvArr.byteOffset === 'number' && uvArr.byteLength > 0) {
+        let pool: Map<number, any> = this.__drMeshVbos;
+        if (!pool) {
+          pool = new Map<number, any>();
+          this.__drMeshVbos = pool;
+        }
+        const key = uvArr.byteOffset;
+        let bd = pool.get(key);
+        if (!bd) {
+          bd = { vertex: null, uv: null, index: null };
+          pool.set(key, bd);
+        }
+        this._bufferData = bd;
+        const res = origDrawMesh.call(this, texNo, idxCount, vertCount, idxArr, vertArr, uvArr, opacity, blendMode, invMask);
+        if (bd.uv && !bd.uv.__drImmutableBuf) bd.uv.__drImmutableBuf = true;
+        if (bd.index && !bd.index.__drImmutableBuf) bd.index.__drImmutableBuf = true;
+        if (bd.vertex && bd.vertex.__drSubDataSize === undefined) {
+          bd.vertex.__drSubDataSize = vertArr.byteLength;
+        }
+        return res;
+      }
+      return origDrawMesh.apply(this, arguments);
+    };
+    if (typeof cubismRendererProto.release === 'function') {
+      const origCubismRelease = cubismRendererProto.release;
+      cubismRendererProto.release = function () {
+        const pool: Map<number, any> | undefined = this.__drMeshVbos;
+        if (pool && this.gl) {
+          pool.forEach((bd) => {
+            try {
+              if (bd.vertex) this.gl.deleteBuffer?.(bd.vertex);
+              if (bd.uv) this.gl.deleteBuffer?.(bd.uv);
+              if (bd.index) this.gl.deleteBuffer?.(bd.index);
+            } catch { /* ignore */ }
+          });
+          pool.clear();
+        }
+        return origCubismRelease.apply(this, arguments);
+      };
+    }
+    if (runtime.LAppPal && typeof runtime.LAppPal.printMessage === 'function') {
+      runtime.LAppPal.printMessage = function () {};
+    }
+    log('[compat] Live2D Cubism 4 per-drawable VBO pool & static UV/index upload skip enabled');
+  }
+  // Live2D cost breakdown for the [perf] line: time spent in the Cubism Core mesh update, the WebGL
+  // renderer, physics and motion each frame. Only wraps methods that exist; costs ~4 timer reads/model/frame.
+  const l2dFw = runtime.Live2DCubismFramework;
+  if (l2dFw && !l2dFw.__drL2dProf) {
+    l2dFw.__drL2dProf = true;
+    const stats = { upd: 0, draw: 0, phys: 0, motion: 0, calls: 0 };
+    const timeMethod = (proto: any, name: string, key: 'upd' | 'draw' | 'phys' | 'motion') => {
+      const orig = proto?.[name];
+      if (typeof orig !== 'function' || orig.__drL2dTimed) return false;
+      const timed = function (this: any) {
+        const t0 = performance.now();
+        try {
+          return orig.apply(this, arguments);
+        } finally {
+          stats[key] += performance.now() - t0;
+          if (key === 'upd') stats.calls++;
+        }
+      };
+      (timed as any).__drL2dTimed = true;
+      proto[name] = timed;
+      return true;
+    };
+    // Cubism Core's per-frame mesh deformation (csmUpdateModel) runs interpreted here (~20 ms per model
+    // per frame on Switch 2). In 'half' mode each model deforms on every other presented frame; motion,
+    // physics and parameters still advance every frame and the renderer keeps drawing the last mesh, so
+    // only the Live2D character animates at half rate. 'auto' switches to half rate once the measured
+    // core cost exceeds L2D_AUTO_MS per model and back when it drops well below it.
+    const rateMode = options?.live2dUpdateRate ?? 'auto';
+    const L2D_AUTO_MS = 6;
+    let halfRate = rateMode === 'half';
+    let autoSamples = 0;
+    let autoSum = 0;
+    const modelProto = l2dFw.CubismModel?.prototype;
+    if (rateMode !== 'full' && modelProto && typeof modelProto.update === 'function' && !modelProto.__drL2dRate) {
+      modelProto.__drL2dRate = true;
+      const origModelUpdate = modelProto.update;
+      modelProto.update = function (this: any) {
+        const frame = runtime.__drRenderFrame | 0;
+        // Skip only when this model already deformed on the immediately preceding presented frame;
+        // the very first update and repeated calls within one frame always run.
+        if (halfRate && this.__drL2dUpdated && frame - (this.__drL2dFrame | 0) === 1) {
+          return undefined;
+        }
+        const t0 = performance.now();
+        const res = origModelUpdate.apply(this, arguments);
+        const dt = performance.now() - t0;
+        this.__drL2dUpdated = true;
+        this.__drL2dFrame = frame;
+        if (rateMode === 'auto') {
+          autoSum += dt;
+          if (++autoSamples >= 30) {
+            const avg = autoSum / autoSamples;
+            const next = halfRate ? avg > L2D_AUTO_MS / 2 : avg > L2D_AUTO_MS;
+            if (next !== halfRate) {
+              halfRate = next;
+              log(`[compat] Live2D core update -> ${halfRate ? 'half' : 'full'} rate (avg ${avg.toFixed(1)}ms/model)`);
+            }
+            autoSamples = 0;
+            autoSum = 0;
+          }
+        }
+        return res;
+      };
+    }
+    const hooked = [
+      timeMethod(l2dFw.CubismModel?.prototype, 'update', 'upd') && 'update',
+      (timeMethod(l2dFw.CubismRenderer_WebGL?.prototype, 'doDrawModel', 'draw') ||
+        timeMethod(l2dFw.CubismRenderer?.prototype, 'drawModel', 'draw')) && 'draw',
+      timeMethod(l2dFw.CubismPhysics?.prototype, 'evaluate', 'phys') && 'physics',
+      (timeMethod(l2dFw.CubismMotionManager?.prototype, 'updateMotion', 'motion') ||
+        timeMethod(l2dFw.CubismMotionQueueManager?.prototype, 'doUpdateMotion', 'motion')) && 'motion',
+    ].filter(Boolean);
+    if (hooked.length) {
+      runtime.__drTakeL2dStats = () => {
+        const out = { ...stats };
+        stats.upd = 0; stats.draw = 0; stats.phys = 0; stats.motion = 0; stats.calls = 0;
+        return out;
+      };
+      log(`[compat] Live2D profiler armed (${hooked.join(', ')})`);
+    }
+  }
+  // In Canvas2D mode, PIXI CanvasRenderer ignores WebGL `.filters` completely, yet FilterController.js
+  // still instantiates PIXI.Filter objects + Displacement sprites and runs filter handlers every frame.
+  if (!isWebGLMode) {
+    for (const scName of ['Scene_Map', 'Scene_Battle'] as const) {
+      const scP = runtime[scName]?.prototype;
+      if (scP && typeof scP.updateTKMfilters === 'function' && !scP.__drSkipCanvasFilters) {
+        scP.__drSkipCanvasFilters = true;
+        scP.updateTKMfilters = function () {};
+      }
     }
   }
 
@@ -2282,6 +3301,62 @@ export function installMvCompat(
     };
   }
 
+  // 6f3c. Quick Menu "Log On-Screen Objects": every visible display object covering at least ~1% of the
+  //       screen, with class, bounds, alpha, blend mode, image source and (for canvas bitmaps) the
+  //       pixel at the bitmap centre, so rendering glitches can be traced to the object that causes them.
+  runtime.__drDumpScene = () => {
+    const scene = SceneManager?._scene;
+    if (!scene) {
+      log('[dump] no active scene');
+      return;
+    }
+    const lines: string[] = [];
+    const MIN_AREA = 8000;
+    const MAX_LINES = 150;
+    const describeBitmap = (bmp: any): string => {
+      if (!bmp) return '';
+      const url = String(bmp._url || bmp.url || bmp._image?.src || '');
+      const name = url ? url.split('/').pop() : `canvas${bmp.width}x${bmp.height}`;
+      let px = '';
+      try {
+        const ctx = bmp._context;
+        if (!url && ctx && bmp.width > 0 && bmp.height > 0) {
+          const d = ctx.getImageData(bmp.width >> 1, bmp.height >> 1, 1, 1).data;
+          px = ` mid=${d[0]},${d[1]},${d[2]},${d[3]}`;
+        }
+      } catch { /* ignore */ }
+      const premul = bmp.baseTexture?.premultipliedAlpha;
+      return ` img=${name}${px}${premul === false ? ' premul=false' : ''}`;
+    };
+    const walk = (obj: any, depth: number) => {
+      if (!obj || lines.length >= MAX_LINES || !obj.visible || obj.worldAlpha <= 0) return;
+      let b: any = null;
+      try { b = obj.getBounds?.(); } catch { /* ignore */ }
+      const area = b ? Math.max(0, b.width) * Math.max(0, b.height) : 0;
+      if (area >= MIN_AREA && obj.renderable !== false) {
+        const cls = obj.constructor?.name || 'Object';
+        let extra = '';
+        if (typeof obj.backOpacity === 'number') {
+          const skin = obj._windowskin || obj.windowskin;
+          const skinName = String(skin?._url || '').split('/').pop();
+          extra += ` win[skin=${skinName} op=${obj.opacity} back=${obj.backOpacity} contents=${obj.contentsOpacity} open=${obj.openness}]`;
+        }
+        if (obj.bitmap) extra += describeBitmap(obj.bitmap);
+        if (obj.filters?.length) extra += ` filters=${obj.filters.map((f: any) => f?.constructor?.name).join('+')}`;
+        if (obj.blendMode) extra += ` blend=${obj.blendMode}`;
+        if (obj.tint !== undefined && obj.tint !== 0xffffff) extra += ` tint=${Number(obj.tint).toString(16)}`;
+        lines.push(
+          `${' '.repeat(Math.min(depth, 12))}${cls} [${Math.round(b.x)},${Math.round(b.y)} ${Math.round(b.width)}x${Math.round(b.height)}] ` +
+          `a=${Number(obj.alpha).toFixed(2)} wa=${Number(obj.worldAlpha).toFixed(2)}${extra}`,
+        );
+      }
+      const kids = obj.children;
+      if (Array.isArray(kids)) for (const k of kids) walk(k, depth + 1);
+    };
+    walk(scene, 0);
+    log(`[dump] scene=${scene.constructor?.name} (${lines.length} large visible objects)\n${lines.join('\n')}`);
+  };
+
   // 6f4. No-op setValue guard + dependency-indexed selective Game_Map.refresh()
   //      Eliminates massive per-frame 150+ event refresh storms when parallel events write
   //      timer / coordinate variables every frame (e.g. Fear & Hunger, lighting/HUD scripts).
@@ -2310,7 +3385,6 @@ export function installMvCompat(
       meetsSrc.includes('switch1Valid') &&
       meetsSrc.includes('variableValid') &&
       meetsSrc.length < 1100;
-    log(`[compat] selectiveRefresh=${isStockMeetsConditions} (meetsConditions len=${meetsSrc.length})`);
 
     const origRequestRefresh = GameMapRefreshProto.requestRefresh;
     GameMapRefreshProto.requestRefresh = function () {
@@ -2653,6 +3727,151 @@ export function installMvCompat(
   if (runtime.Lightmask?.prototype) {
     patchLightmaskObject(runtime.Lightmask.prototype, 'window.Lightmask');
   }
+
+  // Support `liply_MobileLight.js` (e.g. Noel The Mortal Fate): attaches `spriteset._lightMask = new Sprite(maskBitmap)`
+  // with `blendMode = BLEND_MULTIPLY (2)` and redraws CPU `createRadialGradient` on a full-screen 1120x630 canvas
+  // inside `Scene_Map.prototype.update` whenever `Graphics._skipCount === 0` (~24ms/tick -> ~48ms/frame at 2 ticks/f!).
+  // Downscales `maskBitmap` to 0.5x resolution (2x GPU bilinear upscale) and caches each `(r0, r1, c0, c1)` radial
+  // gradient on a tiny offscreen canvas so per-frame lights use fast SIMD `drawImage` blits (<0.3ms/frame).
+  const radialSpriteCache = new Map<string, any>();
+  const patchLiplyLightMaskSprite = (sp: any) => {
+    const bmp = sp?.bitmap;
+    const canvas = bmp?._canvas || bmp?.canvas;
+    const ctx = bmp?._context;
+    if (!sp || !bmp || !canvas || !ctx || sp.blendMode !== 2) return;
+    if (!sp.__drLiplyFast) {
+      sp.__drLiplyFast = true;
+      lightmaskHookedName = 'spriteset._lightMask';
+    }
+    if (!bmp.__drHalfRes) {
+      downscaleLightmaskBitmap({ _maskBitmap: bmp });
+    }
+    const info = bmp.__drHalfRes;
+    if (info) {
+      if (typeof sp.setFrame === 'function') {
+        if (sp._frame?.width !== info.halfW || sp._frame?.height !== info.halfH) {
+          sp.setFrame(0, 0, info.halfW, info.halfH);
+        }
+      }
+      if (sp.scale) {
+        sp.scale.x = info.invSx;
+        sp.scale.y = info.invSy;
+      }
+    }
+    if (!canvas.__drLiplyCtxHooked && typeof canvas.getContext === 'function') {
+      canvas.__drLiplyCtxHooked = true;
+      const origGetCtx = canvas.getContext;
+      canvas.getContext = function (type: string, ...args: any[]) {
+        const c = origGetCtx.call(this, type, ...args);
+        if (type === '2d' && c && bmp.__drHalfRes) {
+          const hr = bmp.__drHalfRes;
+          // Set 0.5x base transform BEFORE liply_MobileLight calls `context.save()` in `initCanvas()`
+          c.setTransform?.(hr.sx, 0, 0, hr.sy, 0, 0);
+        }
+        return c;
+      };
+    }
+    if (!ctx.__drLiplyGradCache && typeof ctx.createRadialGradient === 'function' && typeof ctx.fillRect === 'function' && typeof ctx.drawImage === 'function') {
+      let proto = Object.getPrototypeOf(ctx);
+      let fillDesc: PropertyDescriptor | undefined;
+      while (proto && !fillDesc) {
+        fillDesc = Object.getOwnPropertyDescriptor(proto, 'fillStyle');
+        proto = Object.getPrototypeOf(proto);
+      }
+      if (fillDesc && typeof fillDesc.set === 'function' && typeof fillDesc.get === 'function') {
+        ctx.__drLiplyGradCache = true;
+        const origFillSet = fillDesc.set;
+        const origFillGet = fillDesc.get;
+        const origCreateRG = ctx.createRadialGradient;
+        const origFillRect = ctx.fillRect;
+        const origDrawImage = ctx.drawImage;
+        let pendingRad: any = null;
+        try {
+          Object.defineProperty(ctx, 'fillStyle', {
+            configurable: true,
+            get() { return pendingRad || origFillGet.call(this); },
+            set(v: any) {
+              if (v && v.__drRad) {
+                pendingRad = v;
+              } else {
+                pendingRad = null;
+                origFillSet.call(this, v);
+              }
+            },
+          });
+          ctx.createRadialGradient = function (x0: number, y0: number, r0: number, x1: number, y1: number, r1: number) {
+            if (x0 === x1 && y0 === y1 && r1 > 0 && r1 <= 1024 && r0 >= 0 && r0 <= r1) {
+              return {
+                __drRad: true,
+                x0,
+                y0,
+                r0,
+                r1,
+                c0: '#ffffff',
+                c1: 'black',
+                addColorStop(off: number, col: string) {
+                  if (off <= 0) this.c0 = String(col);
+                  else this.c1 = String(col);
+                },
+              };
+            }
+            return origCreateRG.call(this, x0, y0, r0, x1, y1, r1);
+          };
+          ctx.fillRect = function (rx: number, ry: number, rw: number, rh: number) {
+            const rad = pendingRad;
+            const doc = runtime.document;
+            if (
+              rad &&
+              doc?.createElement &&
+              Math.abs(rw - rad.r1 * 2) <= 2 &&
+              Math.abs(rh - rad.r1 * 2) <= 2
+            ) {
+              const hr = bmp.__drHalfRes;
+              const sx = hr ? hr.sx : 0.5;
+              const sy = hr ? hr.sy : 0.5;
+              const qr0 = Math.round(rad.r0);
+              const qr1 = Math.round(rad.r1);
+              const key = `${qr0}|${qr1}|${rad.c0}|${rad.c1}|${sx.toFixed(3)}`;
+              let spriteCanvas = radialSpriteCache.get(key);
+              if (!spriteCanvas) {
+                const pw = Math.max(2, Math.ceil(qr1 * sx) * 2);
+                const ph = Math.max(2, Math.ceil(qr1 * sy) * 2);
+                const sc = doc.createElement('canvas');
+                sc.width = pw;
+                sc.height = ph;
+                const sctx = sc.getContext?.('2d');
+                if (sctx && typeof sctx.createRadialGradient === 'function') {
+                  sctx.scale?.(pw / (qr1 * 2), ph / (qr1 * 2));
+                  const g = sctx.createRadialGradient(qr1, qr1, qr0, qr1, qr1, qr1);
+                  g.addColorStop(0, rad.c0);
+                  g.addColorStop(1, rad.c1);
+                  sctx.fillStyle = g;
+                  sctx.fillRect(0, 0, qr1 * 2, qr1 * 2);
+                  if (radialSpriteCache.size >= 48) {
+                    const oldest = radialSpriteCache.keys().next().value;
+                    if (oldest !== undefined) radialSpriteCache.delete(oldest);
+                  }
+                  radialSpriteCache.set(key, sc);
+                  spriteCanvas = sc;
+                }
+              }
+              if (spriteCanvas) {
+                origDrawImage.call(this, spriteCanvas, 0, 0, spriteCanvas.width, spriteCanvas.height, rx, ry, rw, rh);
+                return;
+              }
+            }
+            if (rad) {
+              const realG = origCreateRG.call(this, rad.x0, rad.y0, rad.r0, rad.x0, rad.y0, rad.r1);
+              realG.addColorStop(0, rad.c0);
+              realG.addColorStop(1, rad.c1);
+              origFillSet.call(this, realG);
+            }
+            return origFillRect.call(this, rx, ry, rw, rh);
+          };
+        } catch { /* fallback cleanly to unhooked ctx */ }
+      }
+    }
+  };
 
   // 6f4b2. Zero-allocation direct-loop Game_Map.events / eventsXy / eventsXyNt / tileEventsXy / updateEvents
   //        Stock RPG Maker MV uses .filter(fn) & .forEach(fn) on 300+ events dozens of times per frame,
@@ -3012,9 +4231,10 @@ export function installMvCompat(
     };
   }
 
-  // 6f4b2. Zero-allocation event spatial lookup loops (stock eventsXy / eventsXyNt + HalfMove.js
-  //        eventsXyUnitNt + KMS_MapActiveMessage findAvailableMapActiveMessageEvents).
-  //        Avoids allocating fresh 170+ element arrays via this.events().filter(...) on every step.
+  // 6f4b2. O(1) spatial coordinate index for Game_Map.eventsXy / eventsXyNt + zero-allocation
+  //        Typed-Array A* pathfinding (`Game_Character.prototype.findDirectionTo`).
+  //        Speeds up collision checks, HalfMove, MKR_PlayerSensor, and YEP_EventChasePlayer
+  //        chasing enemies (Fear & Hunger, Ambrosia, Nightmare Knight) by 20x-50x in jitless V8!
   const GameCharBaseProto = runtime.Game_CharacterBase?.prototype;
   const isStockCharPos = Boolean(
     GameCharBaseProto?.pos &&
@@ -3022,18 +4242,88 @@ export function installMvCompat(
     String(GameCharBaseProto.pos).includes('this._y === y') &&
     String(GameCharBaseProto.pos).length < 120,
   );
+  if (GameCharBaseProto && !GameCharBaseProto.__drSpatialHooks) {
+    GameCharBaseProto.__drSpatialHooks = true;
+    for (const posMut of ['setPosition', 'copyPosition', 'locate', 'moveStraight', 'moveDiagonally', 'jump'] as const) {
+      const origMut = GameCharBaseProto[posMut];
+      if (typeof origMut === 'function') {
+        GameCharBaseProto[posMut] = function () {
+          if (runtime.$gameMap) runtime.$gameMap._drSpatialDirty = true;
+          return origMut.apply(this, arguments);
+        };
+      }
+    }
+  }
+  const ensureSpatialIndex = (gm: any): Map<number, any[]> | null => {
+    const evs = gm?._events;
+    if (!evs) return null;
+    const fc = Graphics?.frameCount || 0;
+    if (
+      !gm._drSpatialDirty &&
+      gm._drSpatialMap &&
+      gm._drSpatialFrame === fc &&
+      gm._drSpatialMapId === gm._mapId &&
+      gm._drSpatialLen === evs.length
+    ) {
+      return gm._drSpatialMap;
+    }
+    let map: Map<number, any[]> = gm._drSpatialMap;
+    if (!map) {
+      map = new Map<number, any[]>();
+      gm._drSpatialMap = map;
+    } else {
+      map.clear();
+    }
+    for (let i = 0, len = evs.length; i < len; i++) {
+      const ev = evs[i];
+      if (!ev) continue;
+      const ex = ev._x;
+      const ey = ev._y;
+      if ((ex | 0) !== ex || (ey | 0) !== ey) {
+        // Fractional tile coordinates (e.g. HalfMove): abort integer grid index for this map
+        gm._drSpatialNonInt = true;
+        return null;
+      }
+      const key = ((ex & 0xffff) << 16) | (ey & 0xffff);
+      let bucket = map.get(key);
+      if (!bucket) {
+        bucket = [ev];
+        map.set(key, bucket);
+      } else {
+        bucket.push(ev);
+      }
+    }
+    gm._drSpatialDirty = false;
+    gm._drSpatialNonInt = false;
+    gm._drSpatialFrame = fc;
+    gm._drSpatialMapId = gm._mapId;
+    gm._drSpatialLen = evs.length;
+    return map;
+  };
   if (GameMapRefreshProto && !GameMapRefreshProto.__drFastEventLookup) {
     GameMapRefreshProto.__drFastEventLookup = true;
     if (
       isStockCharPos &&
       typeof GameMapRefreshProto.eventsXy === 'function' &&
-      String(GameMapRefreshProto.eventsXy).includes('event.pos(') &&
-      String(GameMapRefreshProto.eventsXy).length < 160
+      (String(GameMapRefreshProto.eventsXy).includes('event.pos(') || String(GameMapRefreshProto.eventsXy).includes('ev.pos(')) &&
+      String(GameMapRefreshProto.eventsXy).length < 260
     ) {
       GameMapRefreshProto.eventsXy = function (x: number, y: number) {
         const evs = this._events;
         const out: any[] = [];
         if (!evs) return out;
+        if (!this._drSpatialNonInt && (x | 0) === x && (y | 0) === y && evs.length >= 16) {
+          const grid = ensureSpatialIndex(this);
+          if (grid) {
+            const bucket = grid.get(((x & 0xffff) << 16) | (y & 0xffff));
+            if (!bucket) return out;
+            for (let i = 0; i < bucket.length; i++) {
+              const ev = bucket[i];
+              if (ev._x === x && ev._y === y) out.push(ev);
+            }
+            return out;
+          }
+        }
         for (let i = 0; i < evs.length; i++) {
           const ev = evs[i];
           if (ev && ev._x === x && ev._y === y) out.push(ev);
@@ -3044,13 +4334,25 @@ export function installMvCompat(
     if (
       isStockCharPos &&
       typeof GameMapRefreshProto.eventsXyNt === 'function' &&
-      String(GameMapRefreshProto.eventsXyNt).includes('event.posNt(') &&
-      String(GameMapRefreshProto.eventsXyNt).length < 170
+      (String(GameMapRefreshProto.eventsXyNt).includes('event.posNt(') || String(GameMapRefreshProto.eventsXyNt).includes('ev.posNt(')) &&
+      String(GameMapRefreshProto.eventsXyNt).length < 260
     ) {
       GameMapRefreshProto.eventsXyNt = function (x: number, y: number) {
         const evs = this._events;
         const out: any[] = [];
         if (!evs) return out;
+        if (!this._drSpatialNonInt && (x | 0) === x && (y | 0) === y && evs.length >= 16) {
+          const grid = ensureSpatialIndex(this);
+          if (grid) {
+            const bucket = grid.get(((x & 0xffff) << 16) | (y & 0xffff));
+            if (!bucket) return out;
+            for (let i = 0; i < bucket.length; i++) {
+              const ev = bucket[i];
+              if (ev._x === x && ev._y === y && !ev.isThrough()) out.push(ev);
+            }
+            return out;
+          }
+        }
         for (let i = 0; i < evs.length; i++) {
           const ev = evs[i];
           if (ev && ev._x === x && ev._y === y && !ev.isThrough()) out.push(ev);
@@ -3089,6 +4391,157 @@ export function installMvCompat(
         }
         return out;
       };
+    }
+  }
+
+  // Zero-allocation Typed-Array A* `Game_Character.prototype.findDirectionTo` (exact match with stock MV).
+  const GameCharProto = runtime.Game_Character?.prototype;
+  if (GameCharProto && typeof GameCharProto.findDirectionTo === 'function' && !GameCharProto.__drFastAStar) {
+    const astarSrc = String(GameCharProto.findDirectionTo);
+    if (
+      astarSrc.includes('searchLimit') &&
+      astarSrc.includes('closedList') &&
+      astarSrc.includes('roundXWithDirection') &&
+      astarSrc.length < 2600
+    ) {
+      GameCharProto.__drFastAStar = true;
+      const origFindDir = GameCharProto.findDirectionTo;
+      const MAX_ASTAR_NODES = 1024;
+      const aNodeX = new Int32Array(MAX_ASTAR_NODES);
+      const aNodeY = new Int32Array(MAX_ASTAR_NODES);
+      const aNodeG = new Int32Array(MAX_ASTAR_NODES);
+      const aNodeF = new Float64Array(MAX_ASTAR_NODES);
+      const aNodeParent = new Int32Array(MAX_ASTAR_NODES);
+      const aNodePos = new Int32Array(MAX_ASTAR_NODES);
+      const aOpenIdx = new Int32Array(MAX_ASTAR_NODES);
+      let aClosedStamp = new Int32Array(4096);
+      let aOpenNodeAtPos = new Int32Array(4096);
+      let aStampGen = 1;
+
+      GameCharProto.findDirectionTo = function (goalX: number, goalY: number) {
+        const gm = runtime.$gameMap;
+        if (!gm || (this.x | 0) !== this.x || (this.y | 0) !== this.y || (goalX | 0) !== goalX || (goalY | 0) !== goalY) {
+          return origFindDir.call(this, goalX, goalY);
+        }
+        const searchLimit = this.searchLimit();
+        const mapWidth = gm.width();
+        const mapHeight = gm.height();
+        if (this.x === goalX && this.y === goalY) return 0;
+        const mapCells = mapWidth * mapHeight;
+        if (mapCells <= 0 || mapCells > 262144) {
+          return origFindDir.call(this, goalX, goalY);
+        }
+        if (aClosedStamp.length < mapCells) {
+          aClosedStamp = new Int32Array(mapCells);
+          aOpenNodeAtPos = new Int32Array(mapCells);
+          aStampGen = 1;
+        } else {
+          aStampGen++;
+          if (aStampGen >= 0xfffff) {
+            aClosedStamp.fill(0);
+            aOpenNodeAtPos.fill(0);
+            aStampGen = 1;
+          }
+        }
+        const gen = aStampGen;
+        const startX = this.x;
+        const startY = this.y;
+        const startPos = startY * mapWidth + startX;
+        aNodeX[0] = startX;
+        aNodeY[0] = startY;
+        aNodeG[0] = 0;
+        aNodeF[0] = gm.distance(startX, startY, goalX, goalY);
+        aNodeParent[0] = -1;
+        aNodePos[0] = startPos;
+        aOpenIdx[0] = 0;
+        aOpenNodeAtPos[startPos] = 1 | (gen << 12);
+        let nodeCount = 1;
+        let openLen = 1;
+        let bestIdx = 0;
+
+        while (openLen > 0) {
+          let minSlot = 0;
+          let minF = aNodeF[aOpenIdx[0]];
+          for (let i = 1; i < openLen; i++) {
+            const f = aNodeF[aOpenIdx[i]];
+            if (f < minF) {
+              minF = f;
+              minSlot = i;
+            }
+          }
+          const curIdx = aOpenIdx[minSlot];
+          openLen--;
+          for (let i = minSlot; i < openLen; i++) aOpenIdx[i] = aOpenIdx[i + 1];
+
+          const curPos = aNodePos[curIdx];
+          aOpenNodeAtPos[curPos] = 0;
+          aClosedStamp[curPos] = gen;
+
+          const x1 = aNodeX[curIdx];
+          const y1 = aNodeY[curIdx];
+          const g1 = aNodeG[curIdx];
+
+          if (x1 === goalX && y1 === goalY) {
+            bestIdx = curIdx;
+            break;
+          }
+          if (g1 >= searchLimit) continue;
+
+          for (let j = 0; j < 4; j++) {
+            const direction = 2 + j * 2;
+            const x2 = gm.roundXWithDirection(x1, direction);
+            const y2 = gm.roundYWithDirection(y1, direction);
+            if (x2 < 0 || x2 >= mapWidth || y2 < 0 || y2 >= mapHeight) continue;
+            const pos2 = y2 * mapWidth + x2;
+            if (aClosedStamp[pos2] === gen) continue;
+            if (!this.canPass(x1, y1, direction)) continue;
+
+            const g2 = g1 + 1;
+            const encodedOpen = aOpenNodeAtPos[pos2];
+            const existingIdx = (encodedOpen !== 0 && (encodedOpen >>> 12) === (gen & 0xfffff))
+              ? ((encodedOpen & 0xfff) - 1)
+              : -1;
+
+            if (existingIdx < 0 || g2 < aNodeG[existingIdx]) {
+              let nIdx = existingIdx;
+              if (nIdx < 0) {
+                if (nodeCount >= MAX_ASTAR_NODES) return origFindDir.call(this, goalX, goalY);
+                nIdx = nodeCount++;
+                aOpenIdx[openLen++] = nIdx;
+                aOpenNodeAtPos[pos2] = ((nIdx + 1) & 0xfff) | ((gen & 0xfffff) << 12);
+              }
+              aNodeParent[nIdx] = curIdx;
+              aNodeX[nIdx] = x2;
+              aNodeY[nIdx] = y2;
+              aNodePos[nIdx] = pos2;
+              aNodeG[nIdx] = g2;
+              const h2 = gm.distance(x2, y2, goalX, goalY);
+              aNodeF[nIdx] = g2 + h2;
+              if (h2 < aNodeF[bestIdx] - aNodeG[bestIdx]) {
+                bestIdx = nIdx;
+              }
+            }
+          }
+        }
+
+        let walk = bestIdx;
+        while (aNodeParent[walk] >= 0 && aNodeParent[walk] !== 0) {
+          walk = aNodeParent[walk];
+        }
+        const deltaX1 = gm.deltaX(aNodeX[walk], startX);
+        const deltaY1 = gm.deltaY(aNodeY[walk], startY);
+        if (deltaY1 > 0) return 2;
+        if (deltaX1 < 0) return 4;
+        if (deltaX1 > 0) return 6;
+        if (deltaY1 < 0) return 8;
+
+        const deltaX2 = this.deltaXFrom(goalX);
+        const deltaY2 = this.deltaYFrom(goalY);
+        if (Math.abs(deltaX2) > Math.abs(deltaY2)) return deltaX2 > 0 ? 4 : 6;
+        if (deltaY2 !== 0) return deltaY2 > 0 ? 8 : 2;
+        return 0;
+      };
+      log('[compat] zero-allocation Typed-Array A* findDirectionTo & O(1) spatial event grid enabled');
     }
   }
   const GamePlayerProto = runtime.Game_Player?.prototype;
@@ -3388,6 +4841,8 @@ export function installMvCompat(
   // 6g. Visibility-safe 1-integer-check Sprite_Character.update + off-screen updateTransform skip
   let charFastTicks = 0;
   let charTotalTicks = 0;
+  let charOffSkips = 0;
+  const charSlowWhy = new Map<string, number>();
   const GameEventCtor = runtime.Game_Event;
   if (SpriteCharProto?.update && GameEventCtor && !SpriteCharProto.__drSafeThrottle) {
     SpriteCharProto.__drSafeThrottle = true;
@@ -3398,8 +4853,46 @@ export function installMvCompat(
         return origCharUpdateTransform.call(this);
       };
     }
+    // Child sprites that are only this sprite's own half-body pair (MV bush depth, or TN_SpriteExtender
+    // which splits EVERY character into _upperBody/_lowerBody) carry no state of their own: their frame,
+    // bitmap and tint are recomputed in the parent's full update, which the fast path already forces
+    // whenever the event moves, turns, animates or changes graphic. Any other child (name pops, lights,
+    // attached effects) still requires the full update every tick.
+    const hasOnlyHalfBodyChildren = (sp: any): boolean => {
+      const kids = sp.children;
+      if (!kids || kids.length === 0) return true;
+      for (let i = 0; i < kids.length; i++) {
+        const k = kids[i];
+        if (k !== sp._upperBody && k !== sp._lowerBody) return false;
+      }
+      return true;
+    };
     const origCharUpdate = SpriteCharProto.update;
     SpriteCharProto.update = function () {
+      // YED_Tiled (OMORI) creates a second `Sprite_CharacterReflect` instance for EVERY event,
+      // follower, vehicle, and player on the map (`ch=128` for 54 events!). Stock `Sprite_CharacterReflect.update`
+      // calls `Sprite_Character.prototype.update` FIRST (setting `this.visible = true`) and THEN calls
+      // `this.updateReflect()` (setting `this.visible = false` when `reflections.length === 0`), which
+      // previously defeated `_drLastVisible` and forced all 64 reflection sprites through the full slow
+      // update every single tick! Patch the subclass prototype once so inactive reflection sprites cost ~0ms.
+      if (typeof this.updateReflect === 'function') {
+        const subProto = Object.getPrototypeOf(this);
+        if (subProto && subProto !== SpriteCharProto && !subProto.__drReflectFast && typeof subProto.update === 'function') {
+          subProto.__drReflectFast = true;
+          const origSubUpdate = subProto.update;
+          subProto.update = function () {
+            const rch = this._character;
+            if (!rch || !rch.reflections || rch.reflections.length === 0) {
+              if (this.visible) this.visible = false;
+              this._drOffscreenRender = true;
+              return;
+            }
+            this._drOffscreenRender = false;
+            return origSubUpdate.call(this);
+          };
+        }
+        return origCharUpdate.call(this);
+      }
       const ch = this._character;
       const gm = runtime.$gameMap;
       if (ch && gm && ch instanceof GameEventCtor) {
@@ -3423,7 +4916,8 @@ export function installMvCompat(
           this._tileId === ch._tileId &&
           !ch._customResource &&
           this.opacity === ch._opacity &&
-          this.visible === !ch._transparent &&
+          this.visible === this._drLastVisible &&
+          ch._transparent === this._drLastTransparent &&
           this.blendMode === ch._blendMode &&
           this._drLastAngle === (ch._angle || 0) &&
           this._drLastAddX === (ch._additionalX || 0) &&
@@ -3434,7 +4928,7 @@ export function installMvCompat(
           !ch._balloonId &&
           !ch._animationPlaying &&
           !ch._balloonPlaying &&
-          (!this.children || this.children.length === 0)
+          hasOnlyHalfBodyChildren(this)
         ) {
           const dispX = gm._displayX;
           const dispY = gm._displayY;
@@ -3456,6 +4950,57 @@ export function installMvCompat(
           return;
         }
 
+        // Off-screen slow-path throttle: sprites that cannot take the fast path (template-event lights,
+        // step-animated emitters, plugin child sprites) still ran the full MV update every tick even
+        // while far outside the view — on Lilialette's 60x50 town map ~200 of 261 sprites. While a
+        // ready sprite stays off-screen with no animation/balloon, only track its position and run the
+        // full update every 8th tick; it gets a full update as soon as it is back near the screen.
+        if (
+          this._drOffscreenRender &&
+          (this._drReadyCount || 0) >= 2 &&
+          !ch._customResource &&
+          !ch._animationId &&
+          !ch._balloonId &&
+          !ch._animationPlaying &&
+          !ch._balloonPlaying &&
+          !this._balloonSprite &&
+          !(this._animationSprites && this._animationSprites.length > 0)
+        ) {
+          const sx = ch.screenX();
+          const sy = ch.screenY();
+          const extra = this.children && this.children.length > 0 ? 256 : 0; // lights / attached sprites
+          const mx = (this._drMarginX || 128) + extra;
+          const my = (this._drMarginY || 128) + extra;
+          const stillOff = sx < -mx || sx > gw + mx || sy < -my || sy > gh + my;
+          this._drOffTick = ((this._drOffTick || 0) + 1) & 7;
+          if (stillOff && this._drOffTick !== 0) {
+            this.x = sx;
+            this.y = sy;
+            charOffSkips++;
+            return;
+          }
+        }
+
+        // Telemetry: first fast-path condition that failed (shown on the [perf-map] line as slow[...])
+        {
+          let why = 'other';
+          if (!this._drFastOk) {
+            if ((this._drReadyCount || 0) < 2) why = 'notReady';
+            else if (!hasOnlyHalfBodyChildren(this)) why = 'children';
+            else if (ch._animationId || ch._balloonId || ch._animationPlaying || ch._balloonPlaying) why = 'anim';
+            else if (ch._animeLight) why = 'animeLight';
+            else why = 'motionData';
+          } else if (this._drStateRev !== ch._drStateRev) why = 'moved';
+          else if (this._tilesetId !== gm._tilesetId) why = 'tileset';
+          else if (this._drLastRealX !== ch._realX || this._drLastRealY !== ch._realY) why = 'pos';
+          else if (this._characterName !== ch._characterName || this._characterIndex !== ch._characterIndex || this._tileId !== ch._tileId) why = 'graphic';
+          else if (this.opacity !== ch._opacity) why = 'opacity';
+          else if (this.visible !== this._drLastVisible || ch._transparent !== this._drLastTransparent) why = 'visible';
+          else if (this.blendMode !== ch._blendMode) why = 'blend';
+          else if (this._drLastAngle !== (ch._angle || 0) || this._drLastScaleX !== (ch._scaleX ?? 100) || this._drLastScaleY !== (ch._scaleY ?? 100)) why = 'xform';
+          charSlowWhy.set(why, (charSlowWhy.get(why) || 0) + 1);
+        }
+
         const out = origCharUpdate.call(this);
         const bmp = this.bitmap;
         const hasGraphic = Boolean(ch._characterName || ch._tileId > 0 || ch._customResource);
@@ -3466,6 +5011,8 @@ export function installMvCompat(
         this._drLastRealX = ch._realX;
         this._drLastRealY = ch._realY;
         this._drLastPosZ = ch._PosZ || 0;
+        this._drLastVisible = this.visible;
+        this._drLastTransparent = ch._transparent;
         this._drLastDX = gm._displayX;
         this._drLastDY = gm._displayY;
         this._drBaseX = this.x;
@@ -3511,11 +5058,734 @@ export function installMvCompat(
           rc >= 2 &&
           !hasMotion &&
           !animOrBalloonActive &&
-          (!this.children || this.children.length === 0);
+          hasOnlyHalfBodyChildren(this);
+        return out;
+      }
+      // Fast-skip transparent unused non-event characters (3 `Game_Vehicle`s + up to 10 unused
+      // `Extra_Followers` slots in OMORI = ~13 invisible sprites ticking every frame on every map).
+      if (ch && ch !== runtime.$gamePlayer) {
+        if (
+          this._drNonEvHidden &&
+          !this.visible &&
+          ch._transparent === true &&
+          (typeof ch.isTransparent !== 'function' || ch.isTransparent()) &&
+          !ch._customResource &&
+          !ch._animationId &&
+          !ch._balloonId &&
+          !ch._animationPlaying &&
+          !ch._balloonPlaying &&
+          !this._balloonSprite &&
+          !(this._animationSprites && this._animationSprites.length > 0) &&
+          hasOnlyHalfBodyChildren(this)
+        ) {
+          return;
+        }
+        this._drOffscreenRender = false;
+        const out = origCharUpdate.call(this);
+        const canHideSkip =
+          !this.visible &&
+          ch._transparent === true &&
+          (typeof ch.isTransparent !== 'function' || ch.isTransparent()) &&
+          !ch._customResource &&
+          !ch._animationId &&
+          !ch._balloonId &&
+          !ch._animationPlaying &&
+          !ch._balloonPlaying &&
+          !this._balloonSprite &&
+          !(this._animationSprites && this._animationSprites.length > 0) &&
+          hasOnlyHalfBodyChildren(this);
+        this._drNonEvHidden = canHideSkip;
+        this._drOffscreenRender = canHideSkip;
         return out;
       }
       return origCharUpdate.call(this);
     };
+  }
+
+  // 6g1b. YED_Tiled (OMORI) per-tick `updateReflection` & `isHalfTile` fast-paths:
+  //       Stock `Game_CharacterBase.prototype.updateReflection` calls `tileWidth()` + `tileHeight()`
+  //       (each running `YED_TiledParameters["Half-tile movement"].toLowerCase()`) AND allocates a
+  //       fresh `this.reflections = []` array on EVERY character on EVERY tick (~3,500 allocations/sec).
+  const YedCharProto = runtime.Game_CharacterBase?.prototype;
+  if (
+    YedCharProto &&
+    typeof YedCharProto.updateReflection === 'function' &&
+    !YedCharProto.__drReflectUpdFast &&
+    String(YedCharProto.updateReflection).includes('isOnReflection')
+  ) {
+    YedCharProto.__drReflectUpdFast = true;
+    const EMPTY_REFLECTIONS: any[] = [];
+    YedCharProto.updateReflection = function () {
+      const gm = runtime.$gameMap;
+      const refls = gm?._reflection;
+      if (!refls || refls.length === 0 || (typeof gm.isTiledMap === 'function' && !gm.isTiledMap())) {
+        if (!this.reflections || this.reflections.length !== 0) {
+          this.reflections = EMPTY_REFLECTIONS;
+        }
+        return;
+      }
+      const mapX = this._realX * gm.tileWidth();
+      const mapY = this._realY * gm.tileHeight();
+      let hit: any[] | null = null;
+      for (let i = 0, len = refls.length; i < len; i++) {
+        const r = refls[i];
+        const rect = r?.rect;
+        if (rect && mapX >= rect.x && mapX <= rect.x + rect.width && mapY >= rect.y && mapY <= rect.y + rect.height) {
+          if (!hit) hit = [r];
+          else hit.push(r);
+        }
+      }
+      this.reflections = hit || EMPTY_REFLECTIONS;
+    };
+  }
+  const YedMapProto = runtime.Game_Map?.prototype;
+  if (
+    YedMapProto &&
+    typeof YedMapProto.isHalfTile === 'function' &&
+    !YedMapProto.__drHalfTileFast &&
+    String(YedMapProto.isHalfTile).includes('Half-tile movement')
+  ) {
+    YedMapProto.__drHalfTileFast = true;
+    const origIsHalfTile = YedMapProto.isHalfTile;
+    let cachedHalfTile: boolean | undefined;
+    YedMapProto.isHalfTile = function () {
+      if (cachedHalfTile === undefined) {
+        cachedHalfTile = Boolean(origIsHalfTile.call(this));
+      }
+      return cachedHalfTile;
+    };
+  }
+
+  // 6g2. Incremental ShaderTilemap painting. Stock MV clears and repaints the whole visible window
+  //      (~29x17 cells at 1280x720, ~7.6 ms on Switch 2) every time the camera crosses a tile boundary,
+  //      i.e. every 8-16 frames while walking -> a hitch on almost every step (Nightmare Knight big maps).
+  //      Keep a fixed paint origin and only paint the newly exposed row/column; tiles already painted
+  //      stay valid (positions are relative to the paint origin and each cell is self-contained). A full
+  //      repaint still happens on refresh (_needsRepaint), resize, or once the painted area exceeds
+  //      ~6 screens. Only installed when updateTransform/_paintAllTiles are the stock implementations.
+  let tmIncCells = 0;
+  const ShaderTmProto = runtime.ShaderTilemap?.prototype;
+  if (
+    ShaderTmProto && !ShaderTmProto.__drIncPaint &&
+    typeof ShaderTmProto._paintTiles === 'function' &&
+    typeof ShaderTmProto._paintAllTiles === 'function' &&
+    typeof ShaderTmProto.updateTransform === 'function'
+  ) {
+    const utSrc = String(ShaderTmProto.updateTransform);
+    const paSrc = String(ShaderTmProto._paintAllTiles);
+    const utStock =
+      utSrc.includes('_paintAllTiles(startX, startY)') && utSrc.includes('_lastStartX') &&
+      !utSrc.includes('animationFrame') && !utSrc.includes('_frameUpdated');
+    const paStock = paSrc.includes('lowerZLayer.clear()') && paSrc.includes('_paintTiles(startX, startY, x, y)');
+    // TF_LayeredMap (wall "billboards"): wraps _paintAllTiles to clear its per-screen-row billboard
+    // ZLayers and replaces _paintTiles, which writes wall tiles into TF_billboards[y], [y+1], [y+2]
+    // (y = screen row). Supported below by giving each billboard a fixed world row instead.
+    const ptSrc = String(ShaderTmProto._paintTiles);
+    const tfMode =
+      utStock && !paStock && paSrc.includes('TF_billboards') && paSrc.includes('.clear()') &&
+      ptSrc.includes('this.TF_billboards[ y ]') && ptSrc.includes('this.TF_billboards[ y + 1 ]') &&
+      ptSrc.includes('this.TF_billboards[ y + 2 ]');
+    const stock = utStock && (paStock || tfMode);
+    const ContainerUT = PIXI?.Container?.prototype?.updateTransform;
+    // pixi-tilemap (MV) rebuilds the vertex data of EVERY rect in a layer whenever its rect count
+    // changes, so appending a column would still cost a full-layer rebuild. When a layer only grew
+    // since the last fill (no clear) and its GPU buffer has room, fill just the new rects, upload, and
+    // mark the layer current so the stock code skips its full rebuild. Layout-checked: 9 numbers per
+    // rect in pointsBuf, 4 vertices x 11 floats per rect.
+    const RectLayerProto = PIXI?.tilemap?.RectTileLayer?.prototype;
+    const rlSrc = RectLayerProto ? String(RectLayerProto.renderWebGL) : '';
+    const rectLayoutOk =
+      rlSrc.includes('this.modificationMarker != vertices') && rlSrc.includes('points.length / 9') &&
+      rlSrc.includes('arr[sz++] = u + w - eps') && typeof RectLayerProto?.clear === 'function';
+    if (stock && rectLayoutOk && !RectLayerProto.__drAppendFill) {
+      RectLayerProto.__drAppendFill = true;
+      const origRlClear = RectLayerProto.clear;
+      RectLayerProto.clear = function (this: any) {
+        this.__drFilled = 0;
+        return origRlClear.apply(this, arguments);
+      };
+      const origRlRender = RectLayerProto.renderWebGL;
+      RectLayerProto.renderWebGL = function (this: any, renderer: any, useSquare?: boolean) {
+        const points = this.pointsBuf;
+        const filled = this.__drFilled | 0;
+        const count = points ? points.length / 9 : 0;
+        if (!useSquare && filled > 0 && count > filled && this.vbArray && this.vbId !== undefined &&
+            this.modificationMarker === filled * 4 && this.vbBuffer && this.vbBuffer.byteLength >= count * 176) {
+          const tile = renderer?.plugins?.tilemap;
+          const vb = tile?.getVb?.(this.vbId);
+          const gl = renderer?.gl;
+          // The GPU buffer must already hold the whole vbBuffer (stock uploads it on (re)allocation)
+          if (vb?.vb && gl && typeof vb.vb.bind === 'function' && vb.vb.data && vb.vb.data.byteLength >= count * 176) {
+            const arr = this.vbArray;
+            let sz = filled * 44;
+            for (let i = filled * 9; i < points.length; i += 9) {
+              const eps = 0.5;
+              const textureId = points[i + 8] >> 2;
+              const shiftU = 1024 * (points[i + 8] & 1);
+              const shiftV = 1024 * ((points[i + 8] >> 1) & 1);
+              const x = points[i + 2], y = points[i + 3];
+              const w = points[i + 4], h = points[i + 5];
+              const u = points[i] + shiftU, v = points[i + 1] + shiftV;
+              const animX = points[i + 6], animY = points[i + 7];
+              const corners = [x, y, u, v, x + w, y, u + w, v, x + w, y + h, u + w, v + h, x, y + h, u, v + h];
+              for (let c = 0; c < 16; c += 4) {
+                arr[sz++] = corners[c];
+                arr[sz++] = corners[c + 1];
+                arr[sz++] = corners[c + 2];
+                arr[sz++] = corners[c + 3];
+                arr[sz++] = u + eps;
+                arr[sz++] = v + eps;
+                arr[sz++] = u + w - eps;
+                arr[sz++] = v + h - eps;
+                arr[sz++] = animX;
+                arr[sz++] = animY;
+                arr[sz++] = textureId;
+              }
+            }
+            // Bind THIS layer's buffer first (upload(..., dontBind) writes to whatever is bound), then
+            // upload only the new rects.
+            vb.vb.bind();
+            gl.bufferSubData(gl.ARRAY_BUFFER, filled * 176, arr.subarray(filled * 44, count * 44));
+            this.modificationMarker = count * 4; // stock code sees the layer as current
+          }
+        }
+        const res = origRlRender.apply(this, arguments);
+        if (!useSquare && points && this.modificationMarker === (points.length / 9) * 4) {
+          this.__drFilled = points.length / 9;
+        }
+        return res;
+      };
+    }
+    // Keep every layer below pixi-tilemap's 16-bit index limit (16384 quads per draw)
+    const MAX_LAYER_RECTS = 12000;
+    const layerRects = (tm: any): number => {
+      let maxRects = 0;
+      for (const z of [tm.lowerLayer, tm.upperLayer]) {
+        const kids = z?.children;
+        if (!kids) continue;
+        for (let i = 0; i < kids.length; i++) {
+          const n = (kids[i]?.pointsBuf?.length || 0) / 9;
+          if (n > maxRects) maxRects = n;
+        }
+      }
+      return maxRects;
+    };
+    if (stock && typeof ContainerUT === 'function') {
+      ShaderTmProto.__drIncPaint = true;
+      const MAX_AREA_SCREENS = 4;
+      // --- TF_LayeredMap support -------------------------------------------------------------------
+      // Sinks swallow tile writes, so one _paintTiles call can be limited to the map layers (billboard
+      // writes dropped) or to a single billboard (map-layer writes and the other two billboards dropped).
+      const sinkRect = { addRect() {}, addFrame() { return true; } };
+      const sinkHolder = { children: [sinkRect] };
+      const sinkBillboard = { children: [{ children: [sinkRect] }] };
+      const suppressBillboards: any = typeof Proxy === 'function'
+        ? new Proxy([], { get: (_t, k) => (k === 'length' ? 0 : sinkBillboard) })
+        : null;
+      // Paint world row W's billboard for map columns [x0, x1): it receives wall tiles from rows
+      // W-1, W-2, W-3 (TF's billboards[y + k] with k = W - r - 1), drawn relative to paint origin pox.
+      const paintBillboard = (tm: any, b: any, W: number, x0: number, x1: number, pox: number) => {
+        if (x1 <= x0) return;
+        const realL = tm.lowerLayer;
+        const realU = tm.upperLayer;
+        const realBB = tm.TF_billboards;
+        const tmp = [sinkBillboard, sinkBillboard, sinkBillboard];
+        tm.lowerLayer = sinkHolder;
+        tm.upperLayer = sinkHolder;
+        try {
+          for (let k = 0; k < 3; k++) {
+            const r = W - k - 1;
+            tmp[0] = sinkBillboard; tmp[1] = sinkBillboard; tmp[2] = sinkBillboard;
+            tmp[k] = b;
+            tm.TF_billboards = tmp;
+            for (let mx = x0; mx < x1; mx++) {
+              tm._paintTiles(pox, r, mx - pox, 0);
+              tmIncCells++;
+            }
+          }
+        } finally {
+          tm.lowerLayer = realL;
+          tm.upperLayer = realU;
+          tm.TF_billboards = realBB;
+        }
+      };
+      // Keep billboards assigned to world rows startY+1 .. startY+N (TF's own window), reusing the
+      // billboard of a row that left the window for the row that entered it.
+      const updateBillboards = (tm: any, startX: number, startY: number, cols: number, pox: number, ox: number, oy: number) => {
+        const bbs = tm.TF_billboards;
+        const tw = tm._tileWidth;
+        const th = tm._tileHeight;
+        const N = bbs.length;
+        const lo = startY + 1;
+        const hi = startY + N;
+        const vx1 = startX + cols;
+        const key = startX + ',' + startY + ',' + pox;
+        if (tm.__drBBKey !== key) {
+          tm.__drBBKey = key;
+          const byRow = new Map<number, any>();
+          const free: any[] = [];
+          for (const b of bbs) {
+            if (b.__drRow !== undefined && b.__drRow >= lo && b.__drRow <= hi && !byRow.has(b.__drRow)) byRow.set(b.__drRow, b);
+            else free.push(b);
+          }
+          for (let W = lo; W <= hi; W++) {
+            let b = byRow.get(W);
+            if (!b) {
+              b = free.pop();
+              if (!b) break;
+              b.clear();
+              b.__drRow = W;
+              paintBillboard(tm, b, W, startX, vx1, pox);
+              b.__drX0 = startX;
+              b.__drX1 = vx1;
+              continue;
+            }
+            if (startX < b.__drX0 || vx1 > b.__drX1) {
+              const nx0 = Math.min(b.__drX0, startX);
+              const nx1 = Math.max(b.__drX1, vx1);
+              if (nx1 - nx0 > cols * MAX_AREA_SCREENS) {
+                b.clear();
+                paintBillboard(tm, b, W, startX, vx1, pox);
+                b.__drX0 = startX;
+                b.__drX1 = vx1;
+              } else {
+                if (startX < b.__drX0) paintBillboard(tm, b, W, startX, b.__drX0, pox);
+                if (vx1 > b.__drX1) paintBillboard(tm, b, W, b.__drX1, vx1, pox);
+                b.__drX0 = nx0;
+                b.__drX1 = nx1;
+              }
+            }
+          }
+        }
+        const bx = pox * tw - ox;
+        for (const b of bbs) {
+          b.position.x = bx;
+          b.position.y = (b.__drRow ?? startY) * th - oy;
+        }
+      };
+      const patchTiledTilemapProto = (tm: any) => {
+        const TiledProto = tm ? Object.getPrototypeOf(tm) : null;
+        if (
+          !TiledProto ||
+          TiledProto === ShaderTmProto ||
+          TiledProto.__drTiledProtoFast ||
+          typeof TiledProto._paintTilesLayer !== 'function' ||
+          typeof TiledProto._getTextureId !== 'function' ||
+          !Array.isArray(tm.tiledData?.layers)
+        ) {
+          return;
+        }
+        TiledProto.__drTiledProtoFast = true;
+        // Replace Babel `Symbol.iterator` + `try/finally` hot loops in YED_Tiled (OMORI):
+        // stock `_getTextureId` allocated an iterator per tile (~2,500x/step) and `_paintTilesLayer`
+        // allocated `Array(n).keys()[Symbol.iterator]()` per row/col, while `_updateLayerPositions`
+        // iterated 256 hidden `_priorityTiles` every frame setting `sprite.y = NaN`.
+        TiledProto._getTextureId = function (this: any, tileId: number) {
+          const ts = this.tiledData?.tilesets;
+          if (!ts) return 0;
+          const len = ts.length;
+          for (let i = 0; i < len; i++) {
+            const t = ts[i];
+            if (tileId >= t.firstgid && tileId < t.firstgid + t.tilecount) return i;
+          }
+          return len;
+        };
+        TiledProto._updateLayerPositions = function (this: any, startX: number, startY: number) {
+          const ox = this.roundPixels ? Math.floor(this.origin.x) : this.origin.x;
+          const oy = this.roundPixels ? Math.floor(this.origin.y) : this.origin.y;
+          const baseX = startX * this._tileWidth - ox;
+          const baseY = startY * this._tileHeight - oy;
+          const layers = this._layers;
+          const tLayers = this.tiledData?.layers;
+          if (layers && tLayers) {
+            for (let i = 0, len = layers.length; i < len; i++) {
+              const layer = layers[i];
+              const ld = tLayers[layer.layerId];
+              layer.position.x = baseX + (ld?.offsetx || 0);
+              layer.position.y = baseY + (ld?.offsety || 0);
+            }
+          }
+          const prio = this._priorityTiles;
+          if (prio && tLayers) {
+            const active = Math.min(prio.length, this._priorityTilesCount || 0);
+            for (let i = 0; i < active; i++) {
+              const sp = prio[i];
+              const ld = tLayers[sp.layerId];
+              sp.x = (sp.origX || 0) + baseX + (ld?.offsetx || 0) + sp.width / 2;
+              sp.y = (sp.origY || 0) + baseY + (ld?.offsety || 0) + sp.height;
+            }
+          }
+        };
+        TiledProto._paintTilesLayer = function (this: any, layer: any, startX: number, startY: number) {
+          const tileCols = Math.ceil(this._width / this._tileWidth) + 1;
+          const tileRows = Math.ceil(this._height / this._tileHeight) + 1;
+          for (let y = 0; y < tileRows; y++) {
+            for (let x = 0; x < tileCols; x++) {
+              this._paintTile(layer, startX, startY, x, y);
+            }
+          }
+        };
+        TiledProto._paintAllTiles = function (this: any, startX: number, startY: number) {
+          const prevCount = this.__drTiledPrioInit ? (this._priorityTilesCount || 0) : -1;
+          this.__drTiledPrioInit = true;
+          this._priorityTilesCount = 0;
+          const layers = this._layers;
+          if (layers) {
+            for (let i = 0, len = layers.length; i < len; i++) {
+              const layer = layers[i];
+              layer.clear();
+              this._paintTiles(layer, startX, startY);
+            }
+          }
+          const tLayers = this.tiledData?.layers;
+          if (tLayers && typeof this._paintObjectLayers === 'function') {
+            for (let id = 0, len = tLayers.length; id < len; id++) {
+              if (tLayers[id]?.type === 'objectgroup') {
+                this._paintObjectLayers(id, startX, startY);
+              }
+            }
+          }
+          const prio = this._priorityTiles;
+          if (prio) {
+            const hideEnd = prevCount >= 0 ? Math.min(prio.length, prevCount) : prio.length;
+            for (let i = this._priorityTilesCount; i < hideEnd; i++) {
+              const sp = prio[i];
+              sp.hide?.();
+              sp.layerId = -1;
+              sp.y = 0;
+            }
+          }
+        };
+      };
+      // YED_Tiled adds 256 `Sprite_Base` instances (`_priorityTiles`) to `this._tilemap.children` on
+      // every map even when 0-5 priority tiles are visible, causing `Tilemap.prototype.update` and
+      // `PIXI.Container.prototype.updateTransform` to visit 256 hidden sprites every tick/frame.
+      const patchTiledPrioritySprites = (tm: any) => {
+        if (!tm || tm.__drPrioSpritesFast) return;
+        const prio = tm._priorityTiles;
+        if (!Array.isArray(prio) || prio.length === 0) return;
+        tm.__drPrioSpritesFast = true;
+        for (let i = 0, len = prio.length; i < len; i++) {
+          const sp = prio[i];
+          if (!sp || sp.__drPrioFast) continue;
+          sp.__drPrioFast = true;
+          const origUpd = sp.update;
+          if (typeof origUpd === 'function') {
+            sp.update = function () {
+              if (this._hiding && (!this._animationSprites || this._animationSprites.length === 0)) {
+                if (this.visible) this.visible = false;
+                return;
+              }
+              return origUpd.call(this);
+            };
+          }
+          const origUT = sp.updateTransform;
+          if (typeof origUT === 'function') {
+            sp.updateTransform = function () {
+              if (!this.visible) return;
+              return origUT.call(this);
+            };
+          }
+        }
+      };
+      const origShaderTmUT = ShaderTmProto.updateTransform;
+      ShaderTmProto.updateTransform = function (this: any) {
+        // Subclasses like YED_Tiled / PKD_Tiled (`TiledTilemap extends ShaderTilemap`, used by OMORI)
+        // override `_createLayers`, `_paintTiles(layer, sx, sy)`, and `_updateLayerPositions` on the
+        // subclass prototype using `this._layers` instead of `this.lowerZLayer` / `this.upperZLayer`.
+        if (
+          !this.lowerZLayer ||
+          !this.upperZLayer ||
+          this._paintTiles !== ShaderTmProto._paintTiles ||
+          this._updateLayerPositions !== ShaderTmProto._updateLayerPositions
+        ) {
+          if (!this.__drTiledChecked) {
+            this.__drTiledChecked = true;
+            patchTiledTilemapProto(this);
+            patchTiledPrioritySprites(this);
+          }
+          return origShaderTmUT.apply(this, arguments);
+        }
+        const ox = this.roundPixels ? Math.floor(this.origin.x) : this.origin.x;
+        const oy = this.roundPixels ? Math.floor(this.origin.y) : this.origin.y;
+        const tw = this._tileWidth;
+        const th = this._tileHeight;
+        const startX = Math.floor((ox - this._margin) / tw);
+        const startY = Math.floor((oy - this._margin) / th);
+        const cols = Math.ceil(this._width / tw) + 1;
+        const rows = Math.ceil(this._height / th) + 1;
+        let p = this.__drPaint;
+        const tf = tfMode && Array.isArray(this.TF_billboards) && suppressBillboards;
+        const fullRepaint = () => {
+          this._paintAllTiles(startX, startY); // clears both Z layers, paints the view at origin startX/Y
+          p = this.__drPaint = { ox: startX, oy: startY, x0: startX, y0: startY, x1: startX + cols, y1: startY + rows, cols, rows };
+          this._needsRepaint = false;
+          if (tf) {
+            // TF's full paint filled billboard i with world row startY+i+1 from the painted rows only;
+            // rows whose source rows reach outside [startY, startY+rows) are repainted completely.
+            const bbs = this.TF_billboards;
+            for (let i = 0; i < bbs.length; i++) {
+              const b = bbs[i];
+              const W = startY + i + 1;
+              b.__drRow = W;
+              b.__drX0 = startX;
+              b.__drX1 = startX + cols;
+              if (W - 3 < startY || W - 1 > startY + rows - 1) {
+                b.clear();
+                paintBillboard(this, b, W, startX, startX + cols, startX);
+              }
+            }
+            this.__drBBKey = '';
+          }
+        };
+        if (this._needsRepaint || !p || p.cols !== cols || p.rows !== rows) {
+          fullRepaint();
+        } else if (startX < p.x0 || startY < p.y0 || startX + cols > p.x1 || startY + rows > p.y1) {
+          const nx0 = Math.min(p.x0, startX);
+          const ny0 = Math.min(p.y0, startY);
+          const nx1 = Math.max(p.x1, startX + cols);
+          const ny1 = Math.max(p.y1, startY + rows);
+          if ((nx1 - nx0) * (ny1 - ny0) > cols * rows * MAX_AREA_SCREENS || layerRects(this) > MAX_LAYER_RECTS) {
+            fullRepaint();
+          } else {
+            const realBB = tf ? this.TF_billboards : null;
+            if (tf) this.TF_billboards = suppressBillboards;
+            try {
+            for (let my = ny0; my < ny1; my++) {
+              const rowPainted = my >= p.y0 && my < p.y1;
+              for (let mx = nx0; mx < nx1; mx++) {
+                if (rowPainted && mx >= p.x0 && mx < p.x1) {
+                  mx = p.x1 - 1; // skip the already-painted span of this row
+                  continue;
+                }
+                this._paintTiles(p.ox, p.oy, mx - p.ox, my - p.oy);
+                tmIncCells++;
+              }
+            }
+            } finally {
+              if (tf) this.TF_billboards = realBB;
+            }
+            p.x0 = nx0; p.y0 = ny0; p.x1 = nx1; p.y1 = ny1;
+          }
+        }
+        const lx = p.ox * tw - ox;
+        const ly = p.oy * th - oy;
+        this.lowerZLayer.position.x = lx;
+        this.lowerZLayer.position.y = ly;
+        this.upperZLayer.position.x = lx;
+        this.upperZLayer.position.y = ly;
+        if (tf) updateBillboards(this, startX, startY, cols, p.ox, ox, oy);
+        this._lastStartX = startX;
+        this._lastStartY = startY;
+        this._sortChildren();
+        ContainerUT.call(this);
+      };
+      log(
+        `[compat] incremental tilemap painting enabled (new rows/columns only while scrolling` +
+        `${RectLayerProto?.__drAppendFill ? ', append-only vertex fill' : ''}${tfMode ? ', TF_LayeredMap billboards' : ''})`,
+      );
+    }
+  }
+  // 6g3. Fast O(N) nearly-sorted `Tilemap.prototype._sortChildren` (eliminates `.bind(this)` closure
+  //      allocation and ~3,500 V8 comparator calls/frame on 400-child maps: `sort=1.4ms/f -> ~0.01ms/f`).
+  const BaseTmProto = runtime.Tilemap?.prototype;
+  if (
+    BaseTmProto &&
+    typeof BaseTmProto._sortChildren === 'function' &&
+    typeof BaseTmProto._compareChildOrder === 'function' &&
+    !BaseTmProto.__drFastSort
+  ) {
+    const sortSrc = String(BaseTmProto._sortChildren);
+    if (sortSrc.includes('this.children.sort') && sortSrc.includes('_compareChildOrder')) {
+      BaseTmProto.__drFastSort = true;
+      const origCompare = BaseTmProto._compareChildOrder;
+      const cmpSrc = String(origCompare);
+      const isStockCompare =
+        cmpSrc.includes('a.z !== b.z') &&
+        cmpSrc.includes('a.y !== b.y') &&
+        cmpSrc.includes('a.spriteId - b.spriteId');
+      const stockCompareFn = (a: any, b: any): number => {
+        if (a.z !== b.z) return a.z - b.z;
+        if (a.y !== b.y) return a.y - b.y;
+        return a.spriteId - b.spriteId;
+      };
+      BaseTmProto._sortChildren = function (this: any) {
+        const kids = this.children;
+        const len = kids ? kids.length : 0;
+        if (len <= 1) return;
+        if (!isStockCompare || this._compareChildOrder !== origCompare) {
+          let sorted = true;
+          for (let i = 1; i < len; i++) {
+            if (this._compareChildOrder(kids[i - 1], kids[i]) > 0) {
+              sorted = false;
+              break;
+            }
+          }
+          if (sorted) return;
+          let bound = this.__drBoundCompare;
+          if (!bound || this.__drBoundCompareFn !== this._compareChildOrder) {
+            this.__drBoundCompareFn = this._compareChildOrder;
+            bound = this.__drBoundCompare = this._compareChildOrder.bind(this);
+          }
+          kids.sort(bound);
+          return;
+        }
+        const first = kids[0];
+        let pz = first.z;
+        let py = first.y;
+        let pid = first.spriteId;
+        if (pz === pz && py === py && pid === pid) {
+          let sorted = true;
+          let allFinite = true;
+          let failIdx = 1;
+          for (let i = 1; i < len; i++) {
+            const cur = kids[i];
+            const cz = cur.z;
+            const cy = cur.y;
+            const cid = cur.spriteId;
+            if (!(cz === cz && cy === cy && cid === cid)) {
+              allFinite = false;
+              sorted = false;
+              break;
+            }
+            if (pz !== cz ? pz > cz : py !== cy ? py > cy : pid > cid) {
+              sorted = false;
+              failIdx = i;
+              break;
+            }
+            pz = cz;
+            py = cy;
+            pid = cid;
+          }
+          if (sorted) return;
+          if (allFinite) {
+            for (let i = failIdx + 1; i < len; i++) {
+              const c = kids[i];
+              if (!(c.z === c.z && c.y === c.y && c.spriteId === c.spriteId)) {
+                allFinite = false;
+                break;
+              }
+            }
+          }
+          if (allFinite) {
+            let inv = 0;
+            for (let i = failIdx; i < len; i++) {
+              const cur = kids[i];
+              const cz = cur.z;
+              const cy = cur.y;
+              const cid = cur.spriteId;
+              let j = i - 1;
+              while (j >= 0) {
+                const p = kids[j];
+                const d = p.z !== cz ? p.z - cz : p.y !== cy ? p.y - cy : p.spriteId - cid;
+                if (d <= 0) break;
+                kids[j + 1] = p;
+                j--;
+                if (++inv > 256) {
+                  kids[j + 1] = cur;
+                  kids.sort(stockCompareFn);
+                  return;
+                }
+              }
+              kids[j + 1] = cur;
+            }
+            return;
+          }
+        }
+        kids.sort(stockCompareFn);
+      };
+    }
+  }
+
+  // 6g4. Direct-to-GPU hoisted `RectTileLayer` & `CompositeRectTileLayer` `renderCanvas` (`directGPU` mode):
+  //      NOTE: Do NOT bake layers onto offscreen `<canvas>` surfaces here — in `nx.js` (`directGPU=true`),
+  //      `GameCanvas` is a Vulkan GPU `SkSurface` whereas `document.createElement('canvas')` is a CPU raster
+  //      surface, so blitting 10 full-screen `672x512` raster canvases uploaded ~14 MB/frame from CPU RAM to
+  //      Vulkan! Drawing directly from immutable `<img>` (`SkImage` cached in VRAM) with hoisted `ctx`,
+  //      `tileAnim`, and cached `baseTexture.source` (plus skipping empty layers & per-layer CSS `fillStyle`)
+  //      keeps everything on the GPU with zero texture uploads.
+  const CanvasCompLayerProto = !isWebGLMode ? PIXI?.tilemap?.CompositeRectTileLayer?.prototype : null;
+  if (
+    CanvasCompLayerProto &&
+    typeof CanvasCompLayerProto.renderCanvas === 'function' &&
+    !CanvasCompLayerProto.__drDirectCompFast
+  ) {
+    const ccSrc = String(CanvasCompLayerProto.renderCanvas);
+    if (ccSrc.includes('dontUseTransform') && ccSrc.includes('setTransform')) {
+      CanvasCompLayerProto.__drDirectCompFast = true;
+      const origCompRenderCanvas = CanvasCompLayerProto.renderCanvas;
+      CanvasCompLayerProto.renderCanvas = function (this: any, renderer: any) {
+        const layers = this.children;
+        if (!layers || layers.length === 0) return;
+        let hasPoints = false;
+        for (let i = 0, len = layers.length; i < len; i++) {
+          if (layers[i]?.pointsBuf?.length > 0) {
+            hasPoints = true;
+            break;
+          }
+        }
+        if (!hasPoints) return;
+        return origCompRenderCanvas.call(this, renderer);
+      };
+    }
+  }
+  const CanvasRectLayerProto = !isWebGLMode ? PIXI?.tilemap?.RectTileLayer?.prototype : null;
+  if (
+    CanvasRectLayerProto &&
+    typeof CanvasRectLayerProto.renderCanvas === 'function' &&
+    !CanvasRectLayerProto.__drDirectCanvasFast
+  ) {
+    const rcSrc = String(CanvasRectLayerProto.renderCanvas);
+    if (rcSrc.includes('pointsBuf') && rcSrc.includes('drawImage')) {
+      CanvasRectLayerProto.__drDirectCanvasFast = true;
+      const origRlRenderCanvas = CanvasRectLayerProto.renderCanvas;
+      CanvasRectLayerProto.renderCanvas = function (this: any, renderer: any) {
+        const points = this.pointsBuf;
+        const texs = this.textures;
+        if (!points || points.length === 0 || !texs || texs.length === 0) return;
+        const ctx = renderer?.context;
+        const tileAnim = renderer?.plugins?.tilemap?.tileAnim;
+        if (!ctx || !tileAnim) return origRlRenderCanvas.call(this, renderer);
+        const hasAnim = Boolean(this.hasAnim);
+        const anim0 = hasAnim ? tileAnim[0] : 0;
+        const anim1 = hasAnim ? tileAnim[1] : 0;
+        let lastTexId = -2;
+        let lastSrc: any = null;
+        let fillSet = false;
+        for (let i = 0, n = points.length; i < n; i += 9) {
+          const texId = points[i + 8];
+          const x2 = points[i + 2];
+          const y2 = points[i + 3];
+          const w = points[i + 4];
+          const h = points[i + 5];
+          if (texId === lastTexId) {
+            if (lastSrc) {
+              const x1 = hasAnim ? points[i] + points[i + 6] * anim0 : points[i];
+              const y1 = hasAnim ? points[i + 1] + points[i + 7] * anim1 : points[i + 1];
+              ctx.drawImage(lastSrc, x1, y1, w, h, x2, y2, w, h);
+            }
+            continue;
+          }
+          if (texId >= 0 && texs[texId] !== undefined) {
+            lastTexId = texId;
+            lastSrc = texs[texId].baseTexture?.source ?? null;
+            if (lastSrc) {
+              const x1 = hasAnim ? points[i] + points[i + 6] * anim0 : points[i];
+              const y1 = hasAnim ? points[i + 1] + points[i + 7] * anim1 : points[i + 1];
+              ctx.drawImage(lastSrc, x1, y1, w, h, x2, y2, w, h);
+            }
+          } else {
+            if (!fillSet) {
+              ctx.fillStyle = '#000000';
+              fillSet = true;
+            }
+            ctx.globalAlpha = 0.5;
+            ctx.fillRect(x2, y2, w, h);
+            ctx.globalAlpha = 1;
+          }
+        }
+      };
+    }
   }
 
   // 6h. Prevent double-tick frame cascade in SceneManager.updateMain (1 update tick per rendered frame)
@@ -3534,6 +5804,14 @@ export function installMvCompat(
   let ssTmUpdMs = 0;
   let ssTmXformMs = 0;
   let ssTmXformFrames = 0;
+  // Tilemap breakdown: full repaints (_paintAllTiles on every tile-boundary crossing) vs child sorting,
+  // plus frame hitches (>33 ms) so movement stutter shows up even when the 5 s average looks fine.
+  let tmPaintCount = 0;
+  let tmPaintMs = 0;
+  let tmPaintMax = 0;
+  let tmSortMs = 0;
+  let hitchFrames = 0;
+  let hitchMax = 0;
   const timeProto = (proto: any, key: string, add: (dt: number) => void) => {
     const orig = proto?.[key];
     if (typeof orig !== 'function' || orig.__drSsTime) return;
@@ -3562,6 +5840,20 @@ export function installMvCompat(
     if (!TmP || !Object.prototype.hasOwnProperty.call(TmP, 'updateTransform')) continue;
     timeProto(TmP, 'updateTransform', (dt) => { ssTmXformMs += dt; ssTmXformFrames++; });
   }
+  for (const tmName of ['Tilemap', 'ShaderTilemap']) {
+    const TmP = runtime[tmName]?.prototype;
+    if (!TmP) continue;
+    if (Object.prototype.hasOwnProperty.call(TmP, '_paintAllTiles')) {
+      timeProto(TmP, '_paintAllTiles', (dt) => {
+        tmPaintCount++;
+        tmPaintMs += dt;
+        if (dt > tmPaintMax) tmPaintMax = dt;
+      });
+    }
+    if (Object.prototype.hasOwnProperty.call(TmP, '_sortChildren')) {
+      timeProto(TmP, '_sortChildren', (dt) => { tmSortMs += dt; });
+    }
+  }
   let mapSpritesetTicks = 0;
   let mapWindowMs = 0;
   let mapTotalMs = 0;
@@ -3582,7 +5874,7 @@ export function installMvCompat(
   const hudFrameHist = new Float32Array(HUD_HIST_LEN);
   let hudFrameHistHead = 0;
 
-  const isProfActive = () => perfLogCount < 24 || runtime.__drHudMode === 'pro';
+  const isProfActive = () => perfLogCount < 12 || runtime.__drHudMode === 'pro';
   isProfActiveRef = isProfActive;
 
   const GameMapProto = runtime.Game_Map?.prototype;
@@ -3647,6 +5939,7 @@ export function installMvCompat(
   }
   const SpritesetMapProto = runtime.Spriteset_Map?.prototype;
   let skipSpritesetThisTick = false;
+  let liplySkipArmed = false;
   if (SpritesetMapProto?.update && !SpritesetMapProto.__drProf) {
     SpritesetMapProto.__drProf = true;
     const origSM = SpritesetMapProto.update;
@@ -3656,6 +5949,7 @@ export function installMvCompat(
         this.__drLmScanned = true;
         if (this._lightmask) patchLightmaskObject(this._lightmask, 'spriteset._lightmask');
         if (this._lighting) patchLightmaskObject(this._lighting, 'spriteset._lighting');
+        if (this._lightMask) patchLiplyLightMaskSprite(this._lightMask);
         // ponidog_BackLog_utf8.js calls `this._BackLog.redraw()` every frame even when hidden,
         // clearing & filling a full-screen 1280x720 bitmap 60x/sec (~3ms/tick!). Skip when invisible.
         const bl = this._BackLog;
@@ -3670,7 +5964,6 @@ export function installMvCompat(
               if (!this.visible) return;
               return origBlRedraw.call(this);
             };
-            log('[compat] ponidog_BackLog hidden-redraw skip attached');
           }
           bl.__drHiddenSkip = true;
         }
@@ -3687,15 +5980,44 @@ export function installMvCompat(
         scanChildren(this, 0);
       }
       if (skipSpritesetThisTick) return;
-      if (!isProfActive()) return origSM.apply(this, arguments);
-      const t0 = performance.now();
-      const res = origSM.apply(this, arguments);
-      const dt = performance.now() - t0;
-      mapSpritesetMs += dt;
-      mapSpritesetTicks++;
-      hudSsMs += dt;
-      hudSsTicks++;
-      return res;
+      const runSm = () => {
+        if (!isProfActive()) return origSM.apply(this, arguments);
+        const t0 = performance.now();
+        const res = origSM.apply(this, arguments);
+        const dt = performance.now() - t0;
+        mapSpritesetMs += dt;
+        mapSpritesetTicks++;
+        hudSsMs += dt;
+        hudSsTicks++;
+        return res;
+      };
+      const out = runSm();
+      // Throttle `liply_MobileLight` (`if (Graphics._skipCount === 0) updateLights(...)` right after
+      // Scene_Map_update) to 30Hz while moving / 15Hz while stationary.
+      const lMask = this._lightMask;
+      if (lMask?.__drLiplyFast && Graphics && Graphics._skipCount === 0) {
+        patchLiplyLightMaskSprite(lMask);
+        const gm = runtime.$gameMap;
+        const gp = runtime.$gamePlayer;
+        const dx = gm?._displayX ?? 0;
+        const dy = gm?._displayY ?? 0;
+        const px = gp?._realX ?? 0;
+        const py = gp?._realY ?? 0;
+        const moved = dx !== this._drLmDX || dy !== this._drLmDY || px !== this._drLmPX || py !== this._drLmPY;
+        const fc = Graphics.frameCount || 0;
+        const interval = moved ? 2 : 4;
+        if (this._drLmReady && (fc % interval) !== 0) {
+          Graphics._skipCount = 1;
+          liplySkipArmed = true;
+        } else {
+          this._drLmDX = dx;
+          this._drLmDY = dy;
+          this._drLmPX = px;
+          this._drLmPY = py;
+          this._drLmReady = true;
+        }
+      }
+      return out;
     };
   }
   const SceneMapProto = runtime.Scene_Map?.prototype;
@@ -3703,13 +6025,21 @@ export function installMvCompat(
     SceneMapProto.__drProf = true;
     const origSceneMapUpdate = SceneMapProto.update;
     SceneMapProto.update = function () {
-      if (!isProfActive()) return origSceneMapUpdate.apply(this, arguments);
-      const t0 = performance.now();
-      const res = origSceneMapUpdate.apply(this, arguments);
-      mapTotalMs += performance.now() - t0;
-      mapTicks++;
-      hudMapTicks++;
-      return res;
+      liplySkipArmed = false;
+      try {
+        if (!isProfActive()) return origSceneMapUpdate.apply(this, arguments);
+        const t0 = performance.now();
+        const res = origSceneMapUpdate.apply(this, arguments);
+        mapTotalMs += performance.now() - t0;
+        mapTicks++;
+        hudMapTicks++;
+        return res;
+      } finally {
+        if (liplySkipArmed && Graphics) {
+          Graphics._skipCount = 0;
+          liplySkipArmed = false;
+        }
+      }
     };
   }
   if (WindowLayerProto?.update && !WindowLayerProto.__drProf) {
@@ -3888,15 +6218,11 @@ export function installMvCompat(
         return origLink.apply(this, arguments);
       };
     }
-    log(
-      `[compat] fast JsonEx enabled (save=${encStock ? 'fast' : 'stock'} ` +
-      `load=${decStock ? 'fast' : resetHook ? 'fast prototype reset (plugin-wrapped decode)' : 'stock'})`,
-    );
   }
 
   // 6j. Scene-transition profiler (menu open / map restore). Wraps scene create*/start methods, Window_*
-  //     constructors + refresh, Spriteset_Map builders and Bitmap drawing; it only measures while a
-  //     transition is in flight and logs the most expensive items for the first few transitions.
+  //     constructors + refresh, Spriteset_Map builders and Bitmap drawing; only logs transitions that
+  //     actually take noticeable time (>= 250ms) so fast transitions keep debug.log clean.
   const transitionProf = {
     active: false,
     label: '',
@@ -3905,24 +6231,28 @@ export function installMvCompat(
     items: new Map<string, { ms: number; n: number }>(),
     logged: 0,
     begin(label: string) {
-      if (this.logged >= 10) return;
+      if (this.logged >= 8) return;
       this.active = true;
       this.label = label;
       this.t0 = performance.now();
       this.frames = 0;
       this.items.clear();
     },
-    end() {
+    end(extraSuffix = '') {
       if (!this.active) return;
       this.active = false;
-      this.logged++;
       const total = performance.now() - this.t0;
+      if (total < 250) return;
+      this.logged++;
       const top = [...this.items.entries()]
-        .filter(([, v]) => v.ms >= 4)
+        .filter(([, v]) => v.ms >= 6)
         .sort((a, b) => b[1].ms - a[1].ms)
-        .slice(0, 14)
+        .slice(0, 10)
         .map(([k, v]) => `${k}=${v.ms.toFixed(0)}ms${v.n > 1 ? `x${v.n}` : ''}`);
-      log(`[prof] ${this.label}: total=${total.toFixed(0)}ms frames=${this.frames} | ${top.join(' ') || '(no item >= 4ms)'}`);
+      log(
+        `[prof] ${this.label}${extraSuffix ? ` (${extraSuffix})` : ''}: ` +
+        `total=${total.toFixed(0)}ms frames=${this.frames}${top.length ? ` | ${top.join(' ')}` : ''}`,
+      );
     },
   };
   function installTransitionProfiler(): void {
@@ -3957,7 +6287,6 @@ export function installMvCompat(
         return [];
       }
     };
-    let n = 0;
     for (const name of Object.getOwnPropertyNames(runtime)) {
       let C: any;
       try { C = runtime[name]; } catch { continue; }
@@ -3967,21 +6296,18 @@ export function installMvCompat(
         for (const k of ownFns(proto)) {
           if (/^(create|start|onMapLoaded|terminate|refresh|load|initialize)/.test(k)) {
             wrap(proto, k, `${name}.${k}`);
-            n++;
           }
         }
       } else if (/^Window_/.test(name)) {
         for (const k of ['initialize', 'refresh', 'drawAllItems', 'drawItem', 'drawFace', 'drawActorFace']) {
           if (Object.prototype.hasOwnProperty.call(proto, k)) {
             wrap(proto, k, `${name}.${k}`);
-            n++;
           }
         }
       } else if (/^Spriteset_/.test(name)) {
         for (const k of ownFns(proto)) {
           if (/^(create|initialize|load)/.test(k)) {
             wrap(proto, k, `${name}.${k}`);
-            n++;
           }
         }
       }
@@ -4005,7 +6331,6 @@ export function installMvCompat(
         return origRender.apply(this, arguments);
       };
     }
-    log(`[prof] transition profiler armed (${n} scene/window methods)`);
   }
 
   function installFastMenuRoundTrip(): void {
@@ -4024,13 +6349,16 @@ export function installMvCompat(
       mapId: number;
       tilesetId: number;
       data: any;
+      mapLoader?: any;
+      tempTiledData?: any;
+      tiledLoaded?: any;
+      tilesetToLoad?: any;
       spriteset: any;
       baseline: Map<any, Set<any>> | null;
       extras: Array<{ parent: any; child: any }>;
     };
     let trip: Trip | null = null;
     let reuseData: Trip | null = null;
-    let logCount = 0;
 
     // Spriteset reuse. With the stock Scene_Map.createSpriteset we simply re-attach the cached spriteset.
     // When a plugin replaced createSpriteset (its override may store extra layers on the *scene*, so it
@@ -4065,11 +6393,6 @@ export function installMvCompat(
     const canReuseSpriteset =
       (coreCreateSpriteset || ctorWrapped) && typeof SceneMapP.start === 'function' &&
       typeof SceneMapP.createSpriteset === 'function';
-    log(
-      `[fastmenu] menu round-trip cache enabled (mapData=on spriteset=${
-        canReuseSpriteset ? (coreCreateSpriteset ? 'on' : 'on via Spriteset_Map hook') : 'off'
-      })`,
-    );
 
     // Snapshot the spriteset's own children (2 levels) right after it was built, so children that
     // scene-level plugin code attaches later (createDisplayObjects / onMapLoaded / start) can be told apart.
@@ -4107,6 +6430,10 @@ export function installMvCompat(
       if (r && r.data && mapId === r.mapId) {
         reuseData = null;
         runtime.$dataMap = r.data;
+        if (r.mapLoader !== undefined) DM._mapLoader = r.mapLoader;
+        if (r.tempTiledData !== undefined) DM._tempTiledData = r.tempTiledData;
+        if (r.tiledLoaded !== undefined) DM._tiledLoaded = r.tiledLoaded;
+        if (r.tilesetToLoad !== undefined) DM._tilesetToLoad = r.tilesetToLoad;
         return;
       }
       return origLoadMapData.apply(this, arguments);
@@ -4178,6 +6505,26 @@ export function installMvCompat(
         try {
           if (this.__drSpritesetReused && t) {
             this.__drBaseline = t.baseline || this._spriteset?.__drBaseline || null;
+            // Re-attach Live2D Sprite_Live2d children (`enc_lv2d.js`) if Spriteset_ForLive2d moved them to a menu scene!
+            const ss = this._spriteset;
+            const l2dHash = ss?.live2dSpriteHash;
+            const picKids = ss?._pictureContainer?.children;
+            if (l2dHash && Array.isArray(picKids)) {
+              for (const k of Object.keys(l2dHash)) {
+                const l2dSp = l2dHash[k];
+                if (!l2dSp) continue;
+                const pid = l2dSp._pictureId ?? l2dSp.pictureId;
+                if (typeof pid === 'number') {
+                  for (let pi = 0; pi < picKids.length; pi++) {
+                    const pSp = picKids[pi];
+                    if (pSp && pSp._pictureId === pid && l2dSp.parent !== pSp) {
+                      pSp.addChild(l2dSp);
+                      break;
+                    }
+                  }
+                }
+              }
+            }
             // Children attached by scene-level plugin code on the first build: if that code attached fresh
             // ones again this time, the old ones are stale duplicates (no longer updated) -> remove them.
             const fresh = collectExtras(this.__drBaseline, t.extras);
@@ -4192,52 +6539,35 @@ export function installMvCompat(
           } else if (canReuseSpriteset) {
             this.__drExtras = collectExtras(this.__drBaseline || null);
           }
+          // Preload party face & GALV_BustMenu bust images asynchronously while on Scene_Map so Scene_Menu opens instantly
+          const IM = runtime.ImageManager;
+          const party = runtime.$gameParty?.members?.();
+          if (IM && Array.isArray(party)) {
+            for (let i = 0; i < party.length; i++) {
+              const actor = party[i];
+              const fn = actor?.faceName?.();
+              if (fn) {
+                IM.loadFace?.(fn);
+                if (runtime.Imported?.Galv_BustMenu && typeof IM.loadPicture === 'function') {
+                  const fi = (Number(actor?.faceIndex?.()) || 0) + 1;
+                  IM.loadPicture(`${fn}_${fi}`);
+                }
+              }
+            }
+          }
         } catch { /* ignore */ }
-        transitionProf.end();
-        if (logCount < 12) {
-          logCount++;
-          const dt = performance.now() - (this.__drTripT0 || performance.now());
-          log(
-            `[fastmenu] Scene_Map ready in ${dt.toFixed(0)}ms ` +
-            `(mapData=${t ? 'reused' : 'loaded'} spriteset=${this.__drSpritesetReused ? 'reused' : 'built'})`,
-          );
-        }
+        transitionProf.end(`mapData=${t ? 'reused' : 'loaded'} spriteset=${this.__drSpritesetReused ? 'reused' : 'built'}`);
         this.__drTrip = null;
         return res;
       };
     }
 
-    let menuOpenT0 = 0;
-    let menuTerminateMs = 0;
-    let menuSnapMs = 0;
-    let menuLogCount = 0;
-    if (typeof SceneManager?.snapForBackground === 'function') {
-      const origSnapFb = SceneManager.snapForBackground;
-      SceneManager.snapForBackground = function () {
-        const s0 = performance.now();
-        try {
-          return origSnapFb.apply(this, arguments);
-        } finally {
-          menuSnapMs = performance.now() - s0;
-        }
-      };
-    }
     const MenuBaseP = runtime.Scene_MenuBase?.prototype;
     if (MenuBaseP && typeof MenuBaseP.start === 'function') {
       const origMenuStart = MenuBaseP.start;
       MenuBaseP.start = function () {
         const res = origMenuStart.apply(this, arguments);
         if (transitionProf.active && transitionProf.label.startsWith('menu open')) transitionProf.end();
-        if (menuOpenT0 > 0 && menuLogCount < 12) {
-          menuLogCount++;
-          const dt = performance.now() - menuOpenT0;
-          log(
-            `[fastmenu] ${this.constructor?.name || 'menu'} ready in ${dt.toFixed(0)}ms ` +
-            `(map terminate=${menuTerminateMs.toFixed(0)}ms incl. snapshot=${menuSnapMs.toFixed(0)}ms, ` +
-            `menu create+load=${(dt - menuTerminateMs).toFixed(0)}ms)`,
-          );
-        }
-        menuOpenT0 = 0;
         return res;
       };
     }
@@ -4246,14 +6576,8 @@ export function installMvCompat(
     SceneMapP.terminate = function () {
       const nextScene = SceneManager?._nextScene;
       const toMenu = Boolean(nextScene && isMenuLikeScene(nextScene));
-      const tt0 = performance.now();
-      menuSnapMs = 0;
       if (toMenu) transitionProf.begin(`menu open (${nextScene?.constructor?.name || 'menu'})`);
       const res = origTerminate.apply(this, arguments);
-      if (toMenu) {
-        menuOpenT0 = tt0;
-        menuTerminateMs = performance.now() - tt0;
-      }
       try {
         const next = SceneManager?._nextScene;
         const gm = runtime.$gameMap;
@@ -4268,6 +6592,10 @@ export function installMvCompat(
             mapId: gm.mapId?.() ?? 0,
             tilesetId: gm.tilesetId?.() ?? 0,
             data: runtime.$dataMap,
+            mapLoader: DM._mapLoader,
+            tempTiledData: DM._tempTiledData,
+            tiledLoaded: DM._tiledLoaded,
+            tilesetToLoad: DM._tilesetToLoad,
             spriteset: keepSs && !ss.parent ? ss : null,
             baseline: this.__drBaseline || null,
             extras: this.__drExtras || [],
@@ -4295,7 +6623,6 @@ export function installMvCompat(
   }
 
   let lastAutoGcMs = 0;
-  let lastSceneChangeMs = 0;
   const runAutoGc = (reason: string, mgr?: any) => {
     if (typeof runtime.gc !== 'function') return;
     try {
@@ -4303,11 +6630,16 @@ export function installMvCompat(
       runtime.gc();
       const t1 = performance.now();
       lastAutoGcMs = t1;
-      if (mgr && typeof mgr._getTimeInMsWithoutMobileSafari === 'function') {
-        mgr._currentTime = mgr._getTimeInMsWithoutMobileSafari();
+      if (mgr) {
+        const nowMs = typeof mgr._getTimeInMsWithoutMobileSafari === 'function'
+          ? mgr._getTimeInMsWithoutMobileSafari()
+          : (typeof mgr.getTimeInMs === 'function' ? mgr.getTimeInMs() : performance.now());
+        mgr._currentTime = nowMs;
         mgr._accumulator = 0;
       }
-      log(`[gc] auto gc (${reason}) took ${(t1 - t0).toFixed(1)}ms`);
+      if (t1 - t0 >= 25) {
+        log(`[gc] scene gc (${reason}) took ${(t1 - t0).toFixed(1)}ms`);
+      }
     } catch { /* ignore */ }
   };
 
@@ -4339,6 +6671,8 @@ export function installMvCompat(
   installFastMenuRoundTrip();
   installTransitionProfiler();
 
+  // Only run stop-the-world V8 mark-compact GC during non-menu scene transitions (while faded out),
+  // NEVER mid-gameplay on Scene_Map (where large old-gen heaps like OMORI's YAML tree stall 180-300ms!).
   if (SceneManager?.changeScene && !SceneManager.__drAutoGcHooked) {
     SceneManager.__drAutoGcHooked = true;
     const origChangeScene = SceneManager.changeScene;
@@ -4347,32 +6681,50 @@ export function installMvCompat(
       const res = origChangeScene.call(this);
       if (prevScene && this._scene !== prevScene) {
         const now = performance.now();
-        lastSceneChangeMs = now;
         const prevName = prevScene.constructor?.name || '?';
         const nextName = this._scene?.constructor?.name || '?';
         const isMenuTransition =
           MENU_SCENES.has(prevName) || MENU_SCENES.has(nextName) || isMenuLikeScene(prevScene) || isMenuLikeScene(this._scene);
-        if (!isMenuTransition && now - lastAutoGcMs >= 30000) {
-          runAutoGc(`scene:${prevName}->${nextName}`, this);
+        if (!isMenuTransition && now - lastAutoGcMs >= 45000) {
+          runAutoGc(`${prevName}->${nextName}`, this);
         }
       }
       return res;
     };
   }
 
-  // Frames rendered while the Quick Menu overlay is open are not counted, so a 5 s perf window that
-  // contains overlay time reports a bogus low FPS; never trigger the low-FPS GC from such a window.
-  let overlaySeenInPerfWindow = false;
+  // Browsers expose no gamepad before the player presses a button, so plugins' gamepad hooks never ran
+  // before the first scene existed on PC. The Switch controller is always connected: e.g. In Stars And
+  // Time's Input._updateGamepadState reads SceneManager._scene._mytextSprite and crashed on frame 1.
+  const InputCls = runtime.Input;
+  if (InputCls && typeof InputCls._pollGamepads === 'function' && !InputCls.__drPollAfterScene) {
+    InputCls.__drPollAfterScene = true;
+    const origPoll = InputCls._pollGamepads;
+    InputCls._pollGamepads = function (this: any) {
+      if (SceneManager && !SceneManager._scene) return;
+      return origPoll.apply(this, arguments);
+    };
+  }
+
+  let loggedFirstMapPerf = false;
   if (SceneManager?.updateMain && !SceneManager.__drUpdateCap) {
     SceneManager.__drUpdateCap = true;
-    const origUpdateMain = SceneManager.updateMain;
     SceneManager.updateMain = function () {
-      if (typeof this._deltaTime !== 'number' || this._deltaTime <= 0 || typeof this._getTimeInMsWithoutMobileSafari !== 'function') {
-        return origUpdateMain.call(this);
+      // Universal fixed-timestep stabilizer for ALL RPG Maker MV versions (1.0 - 1.6.2+) AND
+      // TDDP_FluidTimestep.js (e.g. Fear & Hunger v1.6.0, where _deltaTime is undefined and _dt = 1/60!).
+      const dt = (typeof this._deltaTime === 'number' && this._deltaTime > 0)
+        ? this._deltaTime
+        : (typeof this._dt === 'number' && this._dt > 0 ? this._dt : 1 / 60);
+      const newTime = typeof this._getTimeInMsWithoutMobileSafari === 'function'
+        ? this._getTimeInMsWithoutMobileSafari()
+        : (typeof this.getTimeInMs === 'function' ? this.getTimeInMs() : performance.now());
+      if (typeof this._currentTime !== 'number' || this._currentTime <= 0) {
+        this._currentTime = newTime;
       }
-      const newTime = this._getTimeInMsWithoutMobileSafari();
+      if (typeof this._accumulator !== 'number' || Number.isNaN(this._accumulator)) {
+        this._accumulator = 0;
+      }
       if (runtime.__drOverlayOpen) {
-        overlaySeenInPerfWindow = true;
         this._currentTime = newTime;
         this._accumulator = 0;
         this._skipCount = 0;
@@ -4385,29 +6737,37 @@ export function installMvCompat(
       if (fTime < 0) fTime = 0;
       this._currentTime = newTime;
       this._accumulator += fTime;
-      const maxAccum = this._deltaTime * 2;
+      const maxAccum = dt * 2;
       if (this._accumulator > maxAccum) this._accumulator = maxAccum;
       // VSync phase-lock: Switch 2 refresh can run slightly faster than 60.000Hz (~16.5ms/frame vs
-      // 16.667ms _deltaTime), causing _accumulator to land just under _deltaTime every ~10 frames
-      // and skip an update tick (visible 1-frame camera stutter while walking). Snap to _deltaTime
-      // when within 2.5ms of a tick so 60Hz VSync frames consistently execute 1:1 ticks.
-      if (this._accumulator < this._deltaTime && this._accumulator >= this._deltaTime - 0.0025) {
-        this._accumulator = this._deltaTime;
+      // 16.667ms dt), causing _accumulator to land just under dt every ~10 frames and skip an update
+      // tick (visible 1-frame camera stutter while walking). Snap to dt when within 2.5ms of a tick.
+      if (this._accumulator < dt && this._accumulator >= dt - 0.0025) {
+        this._accumulator = dt;
       }
 
       const u0 = performance.now();
-      while (this._accumulator >= this._deltaTime) {
-        this._accumulator -= this._deltaTime;
+      while (this._accumulator >= dt) {
+        this._accumulator -= dt;
+        if (typeof this._t === 'number') this._t += dt;
         // Support NupuSetting.js (Ruins Seeker) melee hitstop counter
         if (typeof runtime.hitstopflame === 'number' && runtime.hitstopflame > 0) {
           runtime.hitstopflame -= 1;
           continue;
         }
-        // Guard against IEEE-754 1-ULP underflow when _accumulator === _deltaTime * 2
-        skipSpritesetThisTick = this._accumulator >= this._deltaTime * 0.99 && !this.isSceneChanging();
-        this.updateInputData();
-        this.changeScene();
-        this.updateScene();
+        // Guard against IEEE-754 1-ULP underflow when _accumulator === dt * 2; also signal
+        // `Graphics._skipCount = 1` on catch-up ticks so plugins checking `Graphics._skipCount === 0`
+        // (e.g. `liply_MobileLight` in Noel) never double-render heavy canvas passes on a lag frame!
+        skipSpritesetThisTick = this._accumulator >= dt * 0.99 && !this.isSceneChanging();
+        const prevSkip = Graphics ? Graphics._skipCount : undefined;
+        if (skipSpritesetThisTick && Graphics) Graphics._skipCount = Math.max(1, prevSkip || 0);
+        try {
+          this.updateInputData();
+          this.changeScene();
+          this.updateScene();
+        } finally {
+          if (skipSpritesetThisTick && Graphics) Graphics._skipCount = prevSkip ?? 0;
+        }
       }
       skipSpritesetThisTick = false;
       const udt = performance.now() - u0;
@@ -4420,6 +6780,10 @@ export function installMvCompat(
       const now = performance.now();
       const frameDelta = Math.max(0, Math.min(250, now - hudPrevFrameMs));
       hudPrevFrameMs = now;
+      if (frameDelta > 33.4) {
+        hitchFrames++;
+        if (frameDelta > hitchMax) hitchMax = frameDelta;
+      }
       if (runtime.__drHudMode === 'pro') {
         hudFrameHist[hudFrameHistHead] = frameDelta;
         hudFrameHistHead = (hudFrameHistHead + 1) % HUD_HIST_LEN;
@@ -4486,12 +6850,18 @@ export function installMvCompat(
       }
 
       const elapsed = now - perfLastLog;
-      if (elapsed >= 5000) {
+      if (elapsed >= 10000) {
         const n = Math.max(1, perfFrames);
         const fps = (perfFrames * 1000) / elapsed;
         const sceneName = this._scene?.constructor?.name || 'none';
-        if (perfLogCount < 24) {
+        const firstMapSample = sceneName === 'Scene_Map' && !loggedFirstMapPerf;
+        const shouldLogPerf =
+          perfLogCount < 24 &&
+          sceneName !== 'Scene_Boot' &&
+          (firstMapSample || fps < 55 || hitchFrames >= 4 || runtime.__drHudMode === 'pro');
+        if (shouldLogPerf) {
           perfLogCount++;
+          if (sceneName === 'Scene_Map') loggedFirstMapPerf = true;
           const avgFrame = elapsed / n;
           const avgUpd = perfUpdateSum / n;
           const avgRen = perfRenderSum / n;
@@ -4499,45 +6869,45 @@ export function installMvCompat(
           const glSuffix = glSt
             ? ` draws=${glSt.draws} tex=${glSt.texUploads} rbFix=${glSt.rbFixes} glErr=0x${(glSt.err >>> 0).toString(16)}`
             : '';
+          const l2d = typeof runtime.__drTakeL2dStats === 'function' ? runtime.__drTakeL2dStats() : null;
+          const l2dSuffix = l2d && l2d.calls > 0
+            ? ` l2d[models/f=${(l2d.calls / n).toFixed(1)} core=${(l2d.upd / n).toFixed(1)}ms ` +
+              `draw=${(l2d.draw / n).toFixed(1)}ms phys=${(l2d.phys / n).toFixed(1)}ms motion=${(l2d.motion / n).toFixed(1)}ms]`
+            : '';
           log(
             `[perf] fps=${fps.toFixed(1)} frame=${avgFrame.toFixed(1)}ms ` +
             `(update=${avgUpd.toFixed(1)}ms render=${avgRen.toFixed(1)}ms) ` +
-            `scene=${sceneName} directGPU=${host.isDirectGpu()}${glSuffix}`,
+            `scene=${sceneName} directGPU=${host.isDirectGpu()}${glSuffix}${l2dSuffix}`,
           );
-          if (mapTicks > 0) {
+          if (mapTicks > 0 && (fps < 55 || firstMapSample || runtime.__drHudMode === 'pro')) {
             const mt = mapTicks;
             const evCount = runtime.$gameMap?._events?.length ?? 0;
             const chCount = this._scene?._spriteset?._characterSprites?.length ?? 0;
             const picCount = this._scene?._spriteset?._pictureContainer?.children?.length ?? 0;
             const fastPct = charTotalTicks > 0 ? Math.round((charFastTicks * 100) / charTotalTicks) : 0;
+            const offPct = charTotalTicks > 0 ? Math.round((charOffSkips * 100) / charTotalTicks) : 0;
+            const slowTop = [...charSlowWhy.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 4)
+              .map(([k, v]) => `${k}:${charTotalTicks > 0 ? Math.round((v * 100) / charTotalTicks) : 0}%`)
+              .join(' ');
             const st = Math.max(1, mapSpritesetTicks);
             const lmSuffix = lightmaskMs > 0 ? ` lm(${lightmaskHookedName})=${(lightmaskMs / st).toFixed(1)}ms` : '';
             log(
               `[perf-map] tick=${(mapTotalMs / mt).toFixed(1)}ms ` +
               `(gameMap=${(mapGameMapMs / mt).toFixed(1)}ms[ref=${(mapRefreshMs / mt).toFixed(1)} ev=${(mapEventsMs / mt).toFixed(1)} ce=${(mapCommonEvMs / mt).toFixed(1)}] ` +
               `spriteset=${(mapSpritesetMs / st).toFixed(1)}ms[ch=${(ssCharMs / st).toFixed(1)} pic=${(ssPicMs / st).toFixed(1)} tm=${(ssTmUpdMs / st).toFixed(1)}]${lmSuffix} ` +
-              `tmRender=${(ssTmXformMs / Math.max(1, n)).toFixed(1)}ms/f win=${(mapWindowMs / mt).toFixed(1)}ms) ` +
-              `ticks/f=${(mt / n).toFixed(2)} ev=${evCount} ch=${chCount} fast=${fastPct}% pic=${picCount}`,
+              `tmRender=${(ssTmXformMs / Math.max(1, n)).toFixed(1)}ms/f` +
+              `[paint=${tmPaintCount}x${(tmPaintMs / Math.max(1, tmPaintCount)).toFixed(1)}ms max=${tmPaintMax.toFixed(0)} inc=${tmIncCells}cells ` +
+              `sort=${(tmSortMs / Math.max(1, n)).toFixed(1)}ms/f] hitch=${hitchFrames}(max ${hitchMax.toFixed(0)}ms) ` +
+              `win=${(mapWindowMs / mt).toFixed(1)}ms) ` +
+              `ticks/f=${(mt / n).toFixed(2)} ev=${evCount} ch=${chCount} fast=${fastPct}% off=${offPct}% slow[${slowTop}] pic=${picCount}`,
             );
           }
-        }
-        // Reclaim V8 heap buildup only on genuine sustained heap-pressure FPS collapse (<42 FPS,
-        // outside overlay & scene-load transitions) so brief map loads don't trigger 130ms GC freezes.
-        if (
-          fps < 42 &&
-          sceneName === 'Scene_Map' &&
-          !runtime.__drOverlayOpen &&
-          !overlaySeenInPerfWindow &&
-          elapsed < 7500 &&
-          now - lastSceneChangeMs >= 4500 &&
-          now - lastAutoGcMs >= 25000
-        ) {
-          runAutoGc(`low-fps:${fps.toFixed(1)}`, this);
         }
         perfFrames = 0;
         perfUpdateSum = 0;
         perfRenderSum = 0;
-        overlaySeenInPerfWindow = false;
         mapTicks = 0;
         mapGameMapMs = 0;
         mapRefreshMs = 0;
@@ -4549,6 +6919,13 @@ export function installMvCompat(
         ssPicMs = 0;
         ssTmUpdMs = 0;
         ssTmXformMs = 0;
+        tmPaintCount = 0;
+        tmIncCells = 0;
+        tmPaintMs = 0;
+        tmPaintMax = 0;
+        tmSortMs = 0;
+        hitchFrames = 0;
+        hitchMax = 0;
         ssTmXformFrames = 0;
         mapSpritesetTicks = 0;
         mapWindowMs = 0;
@@ -4556,6 +6933,8 @@ export function installMvCompat(
         lightmaskMs = 0;
         charFastTicks = 0;
         charTotalTicks = 0;
+        charOffSkips = 0;
+        charSlowWhy.clear();
         perfLastLog = now;
       }
       this.requestUpdate();

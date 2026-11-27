@@ -10,6 +10,11 @@ import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { build } from 'esbuild';
 
+// Optional read-only checks against real game files: set SW2_TEST_GAMES_DIR to a folder that holds
+// the PC game folders (e.g. `OMORI`, `Dragon Conquista`). Those checks are skipped when it's unset.
+const REAL_GAMES_DIR = process.env.SW2_TEST_GAMES_DIR || '';
+const realGamePath = (...parts) => (REAL_GAMES_DIR ? join(REAL_GAMES_DIR, ...parts) : null);
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const loaderDir = resolve(__dirname, '..');
 const gameWww = resolve(loaderDir, '..', '..', 'Demons Roots', 'www');
@@ -204,6 +209,22 @@ assert.ok(registeredFonts.includes('Amarante-Regular'));
 assert.ok(registeredFonts.includes('ship'));
 assert.ok(registeredFonts.includes('FOT-SkipStd-D'));
 console.log(`[PASS] Automatic font discovery & FontLoad aliasing (${registeredFonts.join(', ')})`);
+
+{
+  const fs = 'precision mediump float;' + String.fromCharCode(10) + 'varying lowp vec4 vColor; uniform mediump sampler2D s;';
+  assert.equal(mod.promoteShaderPrecision(fs), 'precision highp float;' + String.fromCharCode(10) + 'varying highp vec4 vColor; uniform highp sampler2D s;');
+  assert.equal(mod.promoteShaderPrecision('float mediumpx = 1.0; // lowpass'), 'float mediumpx = 1.0; // lowpass', 'only whole-word qualifiers');
+  console.log('  ✓ shader precision promoted to highp');
+}
+// Graphics.loadFont(name, url) at runtime registers the shipped file under the requested family
+// (In Stars And Time: 'default1' <- fonts/VCR_OSD_MONO_1.001.ttf)
+assert.equal(mod.registerFontFamilySync('default1', 'fonts/Amarante-Regular.ttf'), true);
+assert.ok(registeredFonts.includes('default1'), 'requested family registered');
+assert.equal(mod.registerFontFamilySync('default1', 'fonts/Amarante-Regular.ttf'), false, 'registered once');
+assert.equal(mod.registerFontFamilySync('GameFont', 'fonts/ship.otf'), false, 'never replaces a family from fonts/');
+assert.equal(mod.registerFontFamilySync('missing', 'fonts/nope.ttf'), false, 'missing file is ignored');
+assert.equal(mod.registerFontFamilySync('spaced', './fonts/Amarante%2DRegular.ttf'), true, 'relative, URL-encoded path');
+console.log('[PASS] Graphics.loadFont registers runtime font families');
 
 // 4. Verify audio format auto-detection (OGG vs M4A-only)
 const oggSw = createMockSwitch({ 'sdmc:/g/www/audio/bgm/Theme1.rpgmvo': 'ogg' });
@@ -703,9 +724,9 @@ class __MzTestClass { static ok() { const inner = 1; for (let i = 0; i < 2; i++)
 
   // Verify all enabled real MZ game plugins (read-only) parse cleanly after createMzScriptPreparer
   for (const realMz of [
-    'C:/Users/Laptop/Desktop/VN/# new/new_261121/Dragon Conquista',
-    'C:/Users/Laptop/Desktop/VN/# new/new_261121/Stranded with You',
-  ]) {
+    realGamePath('Dragon Conquista'),
+    realGamePath('Stranded with You'),
+  ].filter(Boolean)) {
     const pjsPath = join(realMz, 'js', 'plugins.js');
     if (existsSync(pjsPath)) {
       const pjsSrc = readFileSync(pjsPath, 'utf8');
@@ -726,8 +747,8 @@ class __MzTestClass { static ok() { const inner = 1; for (let i = 0; i < 2; i++)
   }
 
   // Verify WOFF 1.0 -> SFNT TTF/OTF conversion on real MZ mplus-1m-regular.woff
-  const realWoffPath = 'C:/Users/Laptop/Desktop/VN/# new/new_261121/Dragon Conquista/fonts/mplus-1m-regular.woff';
-  if (existsSync(realWoffPath)) {
+  const realWoffPath = realGamePath('Dragon Conquista', 'fonts', 'mplus-1m-regular.woff');
+  if (realWoffPath && existsSync(realWoffPath)) {
     const woffBuf = readFileSync(realWoffPath);
     const woffAb = woffBuf.buffer.slice(woffBuf.byteOffset, woffBuf.byteOffset + woffBuf.byteLength);
     const sfnt = mod.decodeWoffToSfnt(woffAb, (u8) => new Uint8Array(inflateSync(u8)));
@@ -817,6 +838,11 @@ class __MzTestClass { static ok() { const inner = 1; for (let i = 0; i < 2; i++)
   assert.equal(mod.detectMvWebGLReason(null, 'this._renderer = new PIXI.Renderer(options);', null), 'PixiJS v5');
   assert.equal(mod.detectMvWebGLReason(null, null, '/*!\n * pixi.js - v5.3.8\n */'), 'PixiJS v5');
   assert.equal(mod.detectMvWebGLReason('{"name":"YEP_CoreEngine","status":true}', 'new PIXI.CanvasRenderer()', 'pixi.js - v4.5.4'), null);
+  // In Stars And Time hard-wires the renderer type and calls checkWebGL() -> needs WebGL2 mode
+  assert.equal(mod.detectMvWebGLReason(null, null, null,
+    "SceneManager.preferableRendererType = function() {\n        return 'webgl';\n    if (Utils.isOptionValid('canvas')) {"), 'forced WebGL');
+  assert.equal(mod.detectMvWebGLReason(null, null, null,
+    "SceneManager.preferableRendererType = function() {\n    if (Utils.isOptionValid('canvas')) {\n        return 'canvas';"), null);
 
   // FontLoad paired URL extraction
   const flEntries = mod.extractFontLoadEntries(
@@ -929,6 +955,47 @@ class __MzTestClass { static ok() { const inner = 1; for (let i = 0; i < 2; i++)
   sp.update();
   assert.equal(charUpdates, beforeChildCalls + 1);
   assert.equal(sp._drFastOk, false);
+
+  // 4a) TN_SpriteExtender / bush-depth half-body children (_upperBody/_lowerBody) still allow the fast path
+  const tnEv = new MockEvent();
+  const tnSp = new MockSpriteChar(tnEv);
+  tnSp._upperBody = { name: 'upper' };
+  tnSp._lowerBody = { name: 'lower' };
+  tnSp.children.push(tnSp._upperBody, tnSp._lowerBody);
+  tnSp.update(); tnSp.update();
+  assert.equal(tnSp._drFastOk, true, 'half-body children only -> fast path allowed');
+  const beforeTn = charUpdates;
+  tnSp.update();
+  assert.equal(charUpdates, beforeTn, 'unchanged half-body sprite skips the full update');
+  tnEv._drStateRev++; // event turned / animated -> parent recomputes the halves
+  tnSp.update();
+  assert.equal(charUpdates, beforeTn + 1);
+  tnSp.children.push({ name: 'namePop' }); // any other child still forces full updates
+  tnSp.update();
+  assert.equal(tnSp._drFastOk, false);
+
+  // 4b) Off-screen sprites that cannot use the fast path (lights, emitters) run the full update only
+  //     every 8th tick while they stay off-screen, and immediately once they come back into view
+  const farEv = new MockEvent();
+  let farX = 5000;
+  farEv.screenX = () => farX;
+  const farSp = new MockSpriteChar(farEv);
+  farSp.children.push({ name: 'animeLight' });
+  farSp.x = 5000;
+  farSp.update(); farSp.update(); // warm up -> ready & marked off-screen
+  assert.equal(farSp._drOffscreenRender, true);
+  const beforeOff = charUpdates;
+  for (let i = 0; i < 16; i++) farSp.update();
+  assert.equal(charUpdates - beforeOff, 2, 'far off-screen sprite: 2 full updates in 16 ticks');
+  farX = 240; // scrolled back into view
+  const beforeBack = charUpdates;
+  farSp.update();
+  assert.equal(charUpdates, beforeBack + 1, 'sprite back on screen gets a full update immediately');
+  farEv._balloonId = 3; // a balloon on an off-screen event always runs the full update
+  farX = 5000; farSp.x = 5000; farSp._drOffscreenRender = true;
+  const beforeBalloon = charUpdates;
+  farSp.update();
+  assert.equal(charUpdates, beforeBalloon + 1);
 
   // 5) Braille Pattern Blank (U+2800) normalization, patternHeight null-bitmap guard, & Window_EventMiniLabel empty culling
   let drawnText = '';
@@ -1569,6 +1636,2686 @@ class __MzTestClass { static ok() { const inner = 1; for (let i = 0; i < 2; i++)
   assert.equal(b._upperPictures.x, 1);
 
   console.log('[PASS] Lazy window chrome + menu spriteset picture container reuse');
+}
+
+// 26. OMORI & The Coffin of Andy and Leyley compatibility (AES-256-CTR, SHA-256, Zlib, CommonJS, Riruka24.ini, inline scripts, TCOAAL saves & OMORI gamepad)
+{
+  const nodeCrypto = await import('node:crypto');
+  const nodeZlib = await import('node:zlib');
+
+  const gameRoot = 'sdmc:/switch/SW2RPGMGL/games/TestEncryptedGame';
+  const swEnc = createMockSwitch({
+    [`${gameRoot}/Riruka24.ini`]: '[Launch]\r\nArgs=--00112233445566778899aabbccddeeff\r\n',
+    [`${gameRoot}/www/index.html`]: '<html></html>',
+    [`${gameRoot}/www/js/plugins/Test.OMORI`]: 'enc',
+    [`${gameRoot}/www/languages/en/System.HERO`]: 'hero-data',
+    [`${gameRoot}/www/js/libs/custom-pkg/package.json`]: JSON.stringify({ main: './lib/entry.js' }),
+    [`${gameRoot}/www/js/libs/custom-pkg/lib/entry.js`]: "const sub = require('./helper'); module.exports = { answer: sub.val + 2 };",
+    [`${gameRoot}/www/js/libs/custom-pkg/lib/helper.js`]: 'exports.val = 40;',
+  });
+
+  const encTarget = {};
+  mod.installNodeCompat(
+    encTarget,
+    swEnc,
+    `${gameRoot}/www`,
+    `${gameRoot}/save`,
+    undefined,
+    gameRoot,
+    'OMORI',
+  );
+
+  // Riruka24.ini Args + pre-created OMORI/CUTSCENE.json
+  assert.deepEqual(encTarget.nw.App.argv, ['--00112233445566778899aabbccddeeff']);
+  const fsEnc = encTarget.require('fs');
+  const pathEnc = encTarget.require('path');
+  assert.equal(fsEnc.existsSync(`${encTarget.process.env.LOCALAPPDATA}/OMORI/CUTSCENE.json`), true);
+  assert.equal(pathEnc.join('/a/b', 'OMORI/'), '/a/b/OMORI/');
+  assert.equal(pathEnc.relative(`${gameRoot}/www`, `${gameRoot}/www/fonts/Test.ttf`), 'fonts/Test.ttf');
+  // Case-insensitive directory lookup (`/Languages/en/` -> `www/languages/en/`)
+  assert.deepEqual(fsEnc.readdirSync(`${gameRoot}/www/Languages/en/`), ['System.HERO']);
+
+  // Scoped CommonJS require('./...')
+  assert.equal(encTarget.require('./js/libs/custom-pkg').answer, 42);
+
+  // MiniBuffer slice & subarray species safety (regression for Coffin LANGDATA header check)
+  const B = encTarget.Buffer;
+  const fullBuf = B.from('LANGDATA{"hello":"world"}', 'utf8');
+  const sigBuf = B.from('LANGDATA', 'utf8');
+  assert.equal(fullBuf.slice(0, 8).byteLength, 8);
+  assert.equal(fullBuf.subarray(0, 8).byteLength, 8);
+  assert.equal(fullBuf.slice(0, 8).equals(sigBuf), true);
+  assert.equal(B.concat([B.from('AB'), B.from('CD')]).toString('utf8'), 'ABCD');
+
+  // SHA-256 (Coffin `data/System.json` -> `be1a37535e921f91`)
+  const cryptoShim = encTarget.require('crypto');
+  const sysHash = cryptoShim.createHash('sha256').update('data/System.json').digest('hex').slice(0, 16);
+  assert.equal(sysHash, 'be1a37535e921f91');
+  assert.equal(
+    cryptoShim.createHash('sha256').update('The Coffin of Andy and Leyley').digest('hex'),
+    nodeCrypto.createHash('sha256').update('The Coffin of Andy and Leyley').digest('hex'),
+  );
+
+  // AES-256-CTR (streaming unaligned + multi-block, verified bit-for-bit against node:crypto)
+  const key = '00112233445566778899aabbccddeeff';
+  const iv = Buffer.from('000102030405060708090a0b0c0d0e0f', 'hex');
+  const plain = Buffer.alloc(109, 0).map((_, idx) => (idx * 37 + 11) & 0xff);
+  const nodeCipher = nodeCrypto.createCipheriv('aes-256-ctr', key, iv);
+  const encrypted = Buffer.concat([nodeCipher.update(plain), nodeCipher.final()]);
+  const decStream = cryptoShim.createDecipheriv('aes-256-ctr', key, iv);
+  const part1 = decStream.update(encrypted.subarray(0, 7));   // unaligned 7 bytes
+  const part2 = decStream.update(encrypted.subarray(7, 60));  // crosses multiple 16B blocks
+  const part3 = decStream.update(encrypted.subarray(60));     // tail
+  const decCombined = B.concat([part1, part2, part3, decStream.final()]);
+  assert.deepEqual([...decCombined], [...plain]);
+
+  // Zlib inflateSync & gunzipSync
+  const zlibShim = encTarget.require('zlib');
+  const samplePayload = Buffer.from('Coffin & OMORI Switch 2 Zlib Test! '.repeat(60), 'utf8');
+  assert.equal(zlibShim.inflateSync(nodeZlib.deflateSync(samplePayload)).toString('utf8'), samplePayload.toString('utf8'));
+  assert.equal(zlibShim.gunzipSync(nodeZlib.gzipSync(samplePayload)).toString('utf8'), samplePayload.toString('utf8'));
+
+  // AudioStreaming.js trailing `_()` bootstrap preservation + .OMORI skip + Yanfly.PreloadedMaps dedupe
+  const prep = mod.createScriptPreparer();
+  assert.equal(prep('js/plugins/AudioStreaming.js', '/* audio */\nfunction foo(){}_();'), 'if (typeof _ === "function") _();');
+  assert.equal(prep('js/plugins/AudioStreaming.OMORI', '/* plain audio */'), null);
+  assert.equal(prep('js/plugins/OggOnly.OMORI', '/* stbvorbis */'), null);
+  const dedupedYanfly = prep('js/plugins/YEP_EventCopier.OMORI', 'if (Yanfly.PreloadedMaps[mapId]) return;');
+  assert.ok(dedupedYanfly.includes('Yanfly.PreloadedMaps[mapId] !== undefined'));
+
+  // Inline <script>, <style>.sheet.insertRule, document.getElementsByTagName('head').item(0), atob/btoa
+  const hostScreen = { width: 1280, height: 720, addEventListener() {}, getContext: () => null };
+  const dummyAssets = mod.createAssetReader(`${gameRoot}/www`, swEnc);
+  mod.createBrowserHost(dummyAssets, (_p, s) => s, hostScreen, { enableWebGL: false });
+  assert.equal(globalThis.atob(globalThis.btoa('TCOAAL_DRM')), 'TCOAAL_DRM');
+  const headEl = globalThis.document.getElementsByTagName('head').item(0);
+  assert.equal(headEl.tagName, 'HEAD');
+  const styleEl = globalThis.document.createElement('style');
+  headEl.appendChild(styleEl);
+  assert.equal(styleEl.sheet.insertRule('@font-face { font-family: "Test"; }', 0), 0);
+  globalThis.__inlineRan = 0;
+  const inlineScr = globalThis.document.createElement('script');
+  inlineScr.textContent = 'globalThis.__inlineRan = 77;';
+  globalThis.document.body.appendChild(inlineScr);
+  assert.equal(globalThis.__inlineRan, 77);
+  delete globalThis.__inlineRan;
+
+  // Subdirectory saves & negative/zero autosave slot IDs (CoffinAndyLeyley/)
+  const coffinSaveSw = createMockSwitch();
+  const coffinRt = {
+    StorageManager: {
+      localFileDirectoryPath: () => `${gameRoot}/save/CoffinAndyLeyley/`,
+      localFilePath: (id) => (id > 0
+        ? `${gameRoot}/save/CoffinAndyLeyley/file${id}.rpgsave`
+        : `${gameRoot}/save/CoffinAndyLeyley/auto12345.rpgsave`),
+    },
+    LZString: {
+      compressToBase64: (s) => Buffer.from(s, 'utf8').toString('base64'),
+      decompressFromBase64: (s) => Buffer.from(s, 'base64').toString('utf8'),
+    },
+  };
+  mod.installSdSaves(coffinRt, coffinSaveSw, `${gameRoot}/save`);
+  coffinRt.StorageManager.save(1, '{"slot":1}');
+  coffinRt.StorageManager.save(0, '{"autosave":true}');
+  assert.ok(coffinSaveSw._files.has(`${gameRoot}/save/CoffinAndyLeyley/file1.rpgsave`));
+  assert.ok(coffinSaveSw._files.has(`${gameRoot}/save/CoffinAndyLeyley/auto12345.rpgsave`));
+  assert.equal(coffinRt.StorageManager.load(0), '{"autosave":true}');
+
+  // OMORI custom ConfigManager.setDefaultGamepadKeyMap preservation in input.ts
+  const omoriInputRt = {
+    Input: { keyMapper: {}, gamepadMapper: {}, _gamepadStates: [], _currentState: {} },
+    ConfigManager: {
+      gamepadTips: false,
+      setDefaultKeyboardKeyMap() { omoriInputRt.Input.keyMapper = { 90: 'ok', 88: 'escape', 65: 'tag' }; },
+      setDefaultGamepadKeyMap() { omoriInputRt.Input.gamepadMapper = { 0: 'ok', 1: 'escape', 3: 'tag' }; },
+      applyData(cfg) {
+        omoriInputRt.Input.gamepadMapper = cfg.gamepadInputMap;
+        if (!omoriInputRt.Input.gamepadMapper) this.setDefaultGamepadKeyMap();
+      },
+    },
+  };
+  mod.createInputBridge().installIntoRuntime(omoriInputRt, () => ({ x: 0, y: 0, w: 640, h: 480, gw: 640, gh: 480 }));
+  assert.equal(omoriInputRt.Input.gamepadMapper[1], 'ok');
+  assert.equal(omoriInputRt.Input.gamepadMapper[0], 'escape');
+  assert.equal(omoriInputRt.Input.gamepadMapper[3], 'tag');
+  assert.equal(omoriInputRt.ConfigManager.gamepadTips, true);
+
+  // Read-only verification against real OMORI & Coffin files if present in workspace
+  const realOmoriPlugin = realGamePath('OMORI', 'www', 'js', 'plugins', 'DisableMouse.OMORI');
+  const realOmoriIni = realGamePath('OMORI', 'Riruka24.ini');
+  if (realOmoriPlugin && existsSync(realOmoriPlugin) && existsSync(realOmoriIni)) {
+    const omoriKey = /Args\s*=\s*--(\S+)/.exec(readFileSync(realOmoriIni, 'utf8'))?.[1];
+    assert.ok(omoriKey, 'Riruka24.ini has no Args=--<key>');
+    const raw = readFileSync(realOmoriPlugin);
+    const d = cryptoShim.createDecipheriv('aes-256-ctr', omoriKey, raw.subarray(0, 16));
+    const txt = B.concat([d.update(raw.subarray(16)), d.final()]).toString('utf8');
+    assert.ok(txt.includes('TouchInput._onMouseDown'));
+  }
+  const realCoffinDir = realGamePath('The Coffin of Andy and Leyley', 'www', 'js', 'plugins');
+  if (realCoffinDir && existsSync(join(realCoffinDir, 'YEP_RegionRestrictions.js'))) {
+    const chunks = {};
+    for (const f of readdirSync(realCoffinDir)) {
+      if (!f.endsWith('.js')) continue;
+      const s = readFileSync(join(realCoffinDir, f), 'utf8');
+      for (const m of s.matchAll(/function\s+(_0x[0-9a-f]+_)\(\)\s*\{\s*return\s+"([^"]*)";\s*\}/g)) {
+        chunks[m[1]] = m[2];
+      }
+    }
+    const order = ['_0x375027_', '_0x30b90a_', '_0x990d93_', '_0xb68cd3_', '_0x7144d1_', '_0x19a532_', '_0x490766_'];
+    const joinedB64 = order.map((kName) => chunks[kName]).join('');
+    const decompressed = zlibShim.inflateSync(B.from(joinedB64, 'base64')).toString('utf8');
+    assert.ok(decompressed.includes('BUILD_FLAGS'));
+  }
+
+  console.log('[PASS] OMORI & The Coffin of Andy and Leyley compatibility (AES-256-CTR, SHA-256, Zlib, CommonJS, inline scripts & gamepad)');
+}
+
+// Incremental ShaderTilemap painting: only newly exposed rows/columns are painted while scrolling
+{
+  let paintAllCalls = 0;
+  const painted = [];
+  let containerUT = 0;
+  function MockContainer() {}
+  MockContainer.prototype.updateTransform = function () { containerUT++; };
+  function MockZLayer() { this.position = { x: 0, y: 0 }; this.clears = 0; }
+  MockZLayer.prototype.clear = function () { this.clears++; };
+  function ShaderTilemap() {
+    this.origin = { x: 0, y: 0 };
+    this.roundPixels = true;
+    this._margin = 20;
+    this._tileWidth = 48;
+    this._tileHeight = 48;
+    this._width = 1280 + 40;
+    this._height = 720 + 40;
+    this._needsRepaint = true;
+    this.lowerZLayer = new MockZLayer();
+    this.upperZLayer = new MockZLayer();
+  }
+  // Same shape as stock RPG Maker MV 1.6 rpg_core.js (the patch only installs over the stock code)
+  ShaderTilemap.prototype.updateTransform = function () {
+    if (this.roundPixels) {
+      var ox = Math.floor(this.origin.x);
+      var oy = Math.floor(this.origin.y);
+    } else {
+      ox = this.origin.x;
+      oy = this.origin.y;
+    }
+    var startX = Math.floor((ox - this._margin) / this._tileWidth);
+    var startY = Math.floor((oy - this._margin) / this._tileHeight);
+    this._updateLayerPositions(startX, startY);
+    if (this._needsRepaint || this._lastStartX !== startX || this._lastStartY !== startY) {
+      this._lastStartX = startX;
+      this._lastStartY = startY;
+      this._paintAllTiles(startX, startY);
+      this._needsRepaint = false;
+    }
+    this._sortChildren();
+  };
+  ShaderTilemap.prototype._paintAllTiles = function (startX, startY) {
+    paintAllCalls++;
+    this.lowerZLayer.clear();
+    this.upperZLayer.clear();
+    var tileCols = Math.ceil(this._width / this._tileWidth) + 1;
+    var tileRows = Math.ceil(this._height / this._tileHeight) + 1;
+    for (var y = 0; y < tileRows; y++) {
+      for (var x = 0; x < tileCols; x++) {
+        this._paintTiles(startX, startY, x, y);
+      }
+    }
+  };
+  ShaderTilemap.prototype._paintTiles = function (startX, startY, x, y) {
+    painted.push([startX + x, startY + y, x * this._tileWidth, y * this._tileHeight]);
+  };
+  ShaderTilemap.prototype._updateLayerPositions = function () {};
+  ShaderTilemap.prototype._sortChildren = function () {};
+
+  // pixi-tilemap RectTileLayer with the stock full-rebuild logic (layout: 9 numbers/rect, 4x11 floats)
+  let fullRebuilds = 0;
+  let vbUploads = 0;
+  // Fake GPU: one ARRAY_BUFFER binding point, one byte store per vertex buffer (pixi glCore GLBuffer:
+  // upload(data, offset, dontBind) writes to whatever buffer is currently bound when dontBind is set)
+  const gpu = { bound: null };
+  const makeGlBuffer = () => {
+    const b = {
+      store: new Uint8Array(0), data: null,
+      bind() { gpu.bound = b; },
+      upload(data, offset = 0, dontBind) {
+        if (!dontBind) b.bind();
+        const target = gpu.bound;
+        const bytes = new Uint8Array(data.buffer || data, data.byteOffset || 0, data.byteLength);
+        if (target.store.length >= bytes.length + offset) target.store.set(bytes, offset);
+        else { target.store = new Uint8Array(bytes); }
+        b.data = data;
+      },
+    };
+    return b;
+  };
+  const fakeGl = {
+    ARRAY_BUFFER: 0x8892,
+    bufferSubData(_t, offset, data) {
+      const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      assert.ok(gpu.bound.store.length >= offset + bytes.length, 'bufferSubData within the buffer');
+      gpu.bound.store.set(bytes, offset);
+    },
+  };
+  const vbs = new Map();
+  let nextVbId = 1;
+  function RectTileLayer() { this.pointsBuf = []; this.modificationMarker = 0; this.vbId = nextVbId++; this.vbBuffer = null; }
+  RectTileLayer.prototype.clear = function () { this.pointsBuf.length = 0; this.modificationMarker = 0; };
+  RectTileLayer.prototype.renderWebGL = function (renderer, useSquare) {
+    var points = this.pointsBuf;
+    if (points.length === 0) return;
+    var rectsCount = points.length / 9;
+    var vertices = rectsCount * 4;
+    if (this.modificationMarker != vertices) {
+      this.modificationMarker = vertices;
+      fullRebuilds++;
+      var vs = 44 * vertices;
+      if (!this.vbBuffer || this.vbBuffer.byteLength < vs) {
+        var bk = 44;
+        while (bk < vs) bk *= 2;
+        this.vbBuffer = new ArrayBuffer(bk);
+        this.vbArray = new Float32Array(this.vbBuffer);
+        renderer.plugins.tilemap.getVb(this.vbId).vb.bind();
+        renderer.plugins.tilemap.getVb(this.vbId).vb.upload(this.vbBuffer, 0, true);
+      }
+      var arr = this.vbArray, sz = 0;
+      for (var i = 0; i < points.length; i += 9) {
+        var eps = 0.5;
+        var textureId = (points[i + 8] >> 2);
+        var shiftU = 1024 * (points[i + 8] & 1);
+        var shiftV = 1024 * ((points[i + 8] >> 1) & 1);
+        var x = points[i + 2], y = points[i + 3], w = points[i + 4], h = points[i + 5];
+        var u = points[i] + shiftU, v = points[i + 1] + shiftV;
+        var animX = points[i + 6], animY = points[i + 7];
+        var cs = [x, y, u, v, x + w, y, u + w, v, x + w, y + h, u + w, v + h, x, y + h, u, v + h];
+        for (var c = 0; c < 16; c += 4) {
+          arr[sz++] = cs[c]; arr[sz++] = cs[c + 1]; arr[sz++] = cs[c + 2]; arr[sz++] = cs[c + 3];
+          arr[sz++] = u + eps; arr[sz++] = v + eps; arr[sz++] = u + w - eps; arr[sz++] = v + h - eps;
+          arr[sz++] = animX; arr[sz++] = animY; arr[sz++] = textureId;
+        }
+      }
+      renderer.plugins.tilemap.getVb(this.vbId).vb.bind();
+      renderer.plugins.tilemap.getVb(this.vbId).vb.upload(arr, 0, true);
+      vbUploads++;
+    }
+  };
+  const tmRt = {
+    Graphics: { width: 1280, height: 720, frameCount: 0 },
+    PIXI: { Container: MockContainer, tilemap: { RectTileLayer } },
+    ShaderTilemap,
+  };
+  mod.installMvCompat(tmRt, { isDirectGpu: () => true, getWebGLContext: () => null }, {});
+  assert.equal(ShaderTilemap.prototype.__drIncPaint, true);
+
+  const tm = new ShaderTilemap();
+  // cols = ceil(1320/48)+1 = 29, rows = ceil(760/48)+1 = 17; startX = floor((0-20)/48) = -1
+  tm.updateTransform();
+  assert.equal(paintAllCalls, 1, 'first frame paints the full view');
+  assert.equal(painted.length, 29 * 17);
+  assert.equal(tm.lowerZLayer.position.x, -48);
+  // Walk one tile right: only the new right-hand column is painted, at its position relative to the origin
+  painted.length = 0;
+  tm.origin.x = 48;
+  tm.updateTransform();
+  assert.equal(paintAllCalls, 1, 'no full repaint when crossing a tile boundary');
+  assert.equal(painted.length, 17, 'one new column of 17 cells');
+  assert.ok(painted.every(([mx, , dx]) => mx === 28 && dx === (28 - -1) * 48));
+  assert.equal(tm.lowerZLayer.position.x, -1 * 48 - 48, 'layers stay anchored to the paint origin');
+  assert.equal(tm.upperZLayer.position.x, tm.lowerZLayer.position.x);
+  // Walking back left reuses already painted cells
+  painted.length = 0;
+  tm.origin.x = 0;
+  tm.updateTransform();
+  assert.equal(painted.length, 0);
+  // Diagonal step paints the new row and column once each (no duplicates)
+  tm.origin.x = 96;
+  tm.origin.y = 48;
+  painted.length = 0;
+  tm.updateTransform();
+  const keys = new Set(painted.map(([mx, my]) => `${mx},${my}`));
+  assert.equal(keys.size, painted.length, 'no cell painted twice');
+  // refresh() -> _needsRepaint forces a full repaint
+  tm._needsRepaint = true;
+  tm.updateTransform();
+  assert.equal(paintAllCalls, 2);
+  // Travelling far enough to exceed ~6 screens of painted area triggers a full repaint
+  tm.origin.x += 48 * 29 * 7;
+  tm.updateTransform();
+  assert.equal(paintAllCalls, 3);
+  assert.ok(containerUT >= 5, 'children transforms still updated every frame');
+
+  // Append-only vertex fill: growing a layer fills only the new rects, identical to a full rebuild
+  assert.equal(RectTileLayer.prototype.__drAppendFill, true);
+  const fakeRenderer = {
+    gl: fakeGl,
+    plugins: { tilemap: { getVb: (id) => { if (!vbs.has(id)) vbs.set(id, { vb: makeGlBuffer() }); return vbs.get(id); } } },
+  };
+  const gpuFloats = (layer, n) => Array.from(new Float32Array(vbs.get(layer.vbId).vb.store.buffer.slice(0, n * 176)));
+  const addRects = (layer, n, seed) => {
+    for (let k = 0; k < n; k++) {
+      const t = seed + k;
+      layer.pointsBuf.push(t * 3 % 512, t * 7 % 512, t * 48, (t % 17) * 48, 48, 24, t % 3, 0, (t % 5) << 2 | (t & 3));
+    }
+  };
+  const grown = new RectTileLayer();
+  addRects(grown, 100, 1);
+  grown.renderWebGL(fakeRenderer, false);
+  assert.equal(fullRebuilds, 1);
+  addRects(grown, 10, 101);
+  // Another layer's buffer is bound when the append happens (as after drawing a different layer)
+  const other = new RectTileLayer();
+  addRects(other, 3, 500);
+  other.renderWebGL(fakeRenderer, false);
+  const otherBefore = gpuFloats(other, 3);
+  grown.renderWebGL(fakeRenderer, false);
+  assert.equal(fullRebuilds, 2, 'appending rects must not rebuild the whole layer');
+  assert.deepEqual(gpuFloats(other, 3), otherBefore, 'append must not write into the buffer of another layer');
+  const reference = new RectTileLayer();
+  addRects(reference, 110, 1);
+  reference.renderWebGL(fakeRenderer, false);
+  assert.deepEqual(
+    Array.from(grown.vbArray.subarray(0, 110 * 44)),
+    Array.from(reference.vbArray.subarray(0, 110 * 44)),
+    'append-filled vertices match a full rebuild',
+  );
+  assert.deepEqual(gpuFloats(grown, 110), gpuFloats(reference, 110), 'GPU buffer holds the appended vertices');
+  // clear() resets: the next fill is a normal full rebuild
+  grown.clear();
+  addRects(grown, 5, 7);
+  const rebuildsBefore = fullRebuilds;
+  grown.renderWebGL(fakeRenderer, false);
+  assert.equal(fullRebuilds, rebuildsBefore + 1);
+  console.log('[PASS] Incremental ShaderTilemap painting (new rows/columns only, full repaint on refresh/far travel)');
+}
+
+// TF_LayeredMap-compatible incremental painting must show exactly what TF's full repaint shows
+{
+  const TW = 48;
+  const tileIdAt = (mx, my) => ((mx * 73856093) ^ (my * 19349663)) >>> 0;
+  function makeRectLayer() {
+    return { rects: [], addRect(_t, u, _v, x, y) { this.rects.push({ id: u, x, y }); } };
+  }
+  function makeZLayer() {
+    const rect = makeRectLayer();
+    return { rect, position: { x: 0, y: 0 }, children: [{ children: [rect] }], clear() { rect.rects.length = 0; } };
+  }
+  function defineTf(Cls) {
+    Cls.prototype._drawTile = function (layer, id, dx, dy) { layer.addRect(0, id, 0, dx, dy, TW, TW); };
+    // Same index/offset scheme as TF_LayeredMap's _paintTiles (wall tiles go to billboards y, y+1, y+2)
+    Cls.prototype._paintTiles = function( startX, startY, x, y ) {
+      const mx = startX + x;
+      const my = startY + y;
+      const dx = x * this._tileWidth;
+      const dy = y * this._tileHeight;
+      const tileId = tileIdAt( mx, my );
+      const lowerLayer = this.lowerLayer.children[ 0 ];
+      if( tileId % 5 === 0 ) {
+        const k = tileId % 3;
+        if( k === 1 ) {
+          this._drawTile( this.TF_billboards[ y + 1 ].children[ 0 ].children[ 0 ], tileId, dx, -this._tileHeight * 2 );
+        } else if( k === 2 ) {
+          this._drawTile( this.TF_billboards[ y + 2 ].children[ 0 ].children[ 0 ], tileId, dx, -this._tileHeight * 3 );
+        } else {
+          this._drawTile( this.TF_billboards[ y ].children[ 0 ].children[ 0 ], tileId, dx, -this._tileHeight );
+        }
+      } else {
+        this._drawTile( lowerLayer, tileId, dx, dy );
+      }
+    };
+    const stockPaintAll = function (startX, startY) {
+      this.lowerZLayer.clear();
+      this.upperZLayer.clear();
+      var tileCols = Math.ceil(this._width / this._tileWidth) + 1;
+      var tileRows = Math.ceil(this._height / this._tileHeight) + 1;
+      for (var y = 0; y < tileRows; y++) {
+        for (var x = 0; x < tileCols; x++) {
+          this._paintTiles(startX, startY, x, y);
+        }
+      }
+    };
+    // TF wrapper: clear billboards, then the stock full paint
+    Cls.prototype._paintAllTiles = function( startX, startY ) {
+      for( let curItem of this.TF_billboards ) {
+        curItem.clear();
+      }
+      stockPaintAll.apply( this, arguments );
+    };
+    // TF positions billboard i at world row startY + i + 1
+    Cls.prototype._updateLayerPositions = function (startX, startY) {
+      const ox = Math.floor(this.origin.x);
+      const oy = Math.floor(this.origin.y);
+      this.lowerZLayer.position.x = startX * this._tileWidth - ox;
+      this.lowerZLayer.position.y = startY * this._tileHeight - oy;
+      for (let i = 0; i < this.TF_billboards.length; i++) {
+        this.TF_billboards[i].position.x = startX * this._tileWidth - ox;
+        this.TF_billboards[i].position.y = startY * this._tileHeight - oy + (i + 1) * this._tileHeight;
+      }
+    };
+    Cls.prototype.updateTransform = function () {
+      if (this.roundPixels) {
+        var ox = Math.floor(this.origin.x);
+        var oy = Math.floor(this.origin.y);
+      } else {
+        ox = this.origin.x;
+        oy = this.origin.y;
+      }
+      var startX = Math.floor((ox - this._margin) / this._tileWidth);
+      var startY = Math.floor((oy - this._margin) / this._tileHeight);
+      this._updateLayerPositions(startX, startY);
+      if (this._needsRepaint || this._lastStartX !== startX || this._lastStartY !== startY) {
+        this._lastStartX = startX;
+        this._lastStartY = startY;
+        this._paintAllTiles(startX, startY);
+        this._needsRepaint = false;
+      }
+      this._sortChildren();
+    };
+    Cls.prototype._sortChildren = function () {};
+  }
+  function initTf(t) {
+    t.origin = { x: 0, y: 0 };
+    t.roundPixels = true;
+    t._margin = 20;
+    t._tileWidth = TW;
+    t._tileHeight = TW;
+    t._width = 1280 + 40;
+    t._height = 720 + 40;
+    t._needsRepaint = true;
+    t.lowerRect = makeRectLayer();
+    t.lowerLayer = { children: [t.lowerRect] };
+    t.upperLayer = { children: [makeRectLayer()] };
+    t.lowerZLayer = { position: { x: 0, y: 0 }, clear: () => { t.lowerRect.rects.length = 0; } };
+    t.upperZLayer = { position: { x: 0, y: 0 }, clear() {} };
+    t.TF_billboards = [];
+    for (let i = 0; i < Math.ceil(t._height / TW) + 3; i++) t.TF_billboards.push(makeZLayer());
+  }
+  function ShaderTilemap() { initTf(this); }
+  defineTf(ShaderTilemap);
+  function RefTilemap() { initTf(this); }
+  defineTf(RefTilemap);
+  function MockContainer() {}
+  MockContainer.prototype.updateTransform = function () {};
+  mod.installMvCompat(
+    { Graphics: { width: 1280, height: 720, frameCount: 0 }, PIXI: { Container: MockContainer }, ShaderTilemap },
+    { isDirectGpu: () => true, getWebGLContext: () => null },
+    {},
+  );
+  assert.equal(ShaderTilemap.prototype.__drIncPaint, true, 'TF_LayeredMap tilemaps get incremental painting');
+
+  // Everything visible in the view window: map-layer tiles and, per billboard world row, wall tiles
+  const visible = (t) => {
+    const ox = Math.floor(t.origin.x);
+    const oy = Math.floor(t.origin.y);
+    const startX = Math.floor((ox - t._margin) / TW);
+    const startY = Math.floor((oy - t._margin) / TW);
+    const cols = Math.ceil(t._width / TW) + 1;
+    const rows = Math.ceil(t._height / TW) + 1;
+    const inView = (ax, ay) => ax >= startX * TW && ax < (startX + cols) * TW && ay >= startY * TW && ay < (startY + rows) * TW;
+    const out = [];
+    for (const r of t.lowerRect.rects) {
+      const ax = t.lowerZLayer.position.x + r.x + ox;
+      const ay = t.lowerZLayer.position.y + r.y + oy;
+      if (inView(ax, ay)) out.push(`L${r.id}@${ax},${ay}`);
+    }
+    for (const b of t.TF_billboards) {
+      const W = Math.round((b.position.y + oy) / TW);
+      if (W < startY + 3 || W > startY + rows) continue; // rows TF itself paints completely
+      for (const r of b.rect.rects) {
+        const ax = b.position.x + r.x + ox;
+        const ay = b.position.y + r.y + oy;
+        if (inView(ax, ay)) out.push(`B${W}:${r.id}@${ax},${ay}`);
+      }
+    }
+    return out.sort();
+  };
+  const ours = new ShaderTilemap();
+  const ref = new RefTilemap();
+  const path = [[0, 0], [48, 0], [96, 0], [96, 48], [96, 96], [48, 96], [0, 48], [-48, 0], [-48, -48],
+    [0, 0], [24, 30], [72, 75], [120, 125], [48 * 29 * 6, 0], [48 * 29 * 6 + 48, 48]];
+  for (const [x, y] of path) {
+    ours.origin.x = ref.origin.x = x;
+    ours.origin.y = ref.origin.y = y;
+    ours.updateTransform();
+    ref.updateTransform();
+    const a = visible(ours);
+    const b = visible(ref);
+    assert.ok(a.length > 100);
+    assert.ok(a.filter((e) => e[0] === 'B').length > 20, 'billboard wall tiles are part of the comparison');
+    assert.deepEqual(a, b, `view at origin ${x},${y} must match TF's full repaint`);
+  }
+  console.log('[PASS] TF_LayeredMap-compatible incremental tilemap painting matches full repaints');
+}
+
+// WOLF RPG Editor game discovery & save counting (e.g. Purgatory)
+{
+  const wolfSw = createMockSwitch({
+    'sdmc:/switch/SW2RPGMGL/engines/wolf-engine-switch2.nro': 'NRO',
+    'sdmc:/switch/SW2RPGMGL/games/Purgatory/Data.wolf': 'DX_WOLF_210',
+    'sdmc:/switch/SW2RPGMGL/games/Purgatory/Game.exe': 'MZ',
+    'sdmc:/switch/SW2RPGMGL/games/Purgatory/Game.ini': '[Game]\r\nSoftModeFlag=1\r\n',
+    'sdmc:/switch/SW2RPGMGL/games/Purgatory/Save/SaveData1.sav': 's1',
+    'sdmc:/switch/SW2RPGMGL/games/Purgatory/Save/SaveData2.sav': 's2',
+    'sdmc:/switch/SW2RPGMGL/games/Purgatory/Save/SysSaveData.sav': 'sys',
+    'sdmc:/switch/SW2RPGMGL/games/UnpackedWolf/Data/BasicData/Game.dat': 'DAT',
+  });
+  const wolfFound = mod.discoverGames(wolfSw, 'sdmc:/switch/SW2RPGMGL');
+  assert.equal(wolfFound.length, 2);
+  assert.equal(wolfFound[0].title, 'Purgatory');
+  assert.equal(wolfFound[0].engine, 'wolf');
+  assert.equal(wolfFound[0].encrypted, true);
+  assert.equal(wolfFound[0].saveCount, 2);
+  assert.equal(mod.engineBadgeLabel(wolfFound[0].engine), 'WOLF');
+  assert.equal(wolfFound[1].title, 'UnpackedWolf');
+  assert.equal(wolfFound[1].engine, 'wolf');
+  assert.equal(wolfFound[1].encrypted, false);
+  assert.equal(
+    mod.findWolfNroPath(wolfSw, 'sdmc:/switch/SW2RPGMGL'),
+    'sdmc:/switch/SW2RPGMGL/engines/wolf-engine-switch2.nro',
+  );
+  console.log('[PASS] WOLF RPG Editor discovery (Data.wolf & unpacked BasicData, non-RGSS Game.ini, Save/*.sav count)');
+}
+
+// MV Performance & GPU Fast-Path Verification (Spine WebGL2 detection, TDDP_FluidTimestep / MV 1.6.0
+// universal timestep cap, O(1) spatial event grid, zero-alloc Typed-Array A* pathfinding, WebAudio
+// decoded SE LRU cache, Bitmap.measureTextWidth memoization, Sprite flash quantization & save slot cache)
+{
+  // 1. Spine WebGL2 detection (Nightmare Knight) + Live2D (Lilialette's Hustle) + PixiJS v5 (Ambrosia)
+  assert.equal(
+    mod.detectMvWebGLReason('var $plugins = [{"name":"PictureSpine","status":true}];', null, null),
+    'Spine',
+  );
+  assert.equal(
+    mod.detectMvWebGLReason('var $plugins = [{"name":"enc_lv2d","status":true}];', null, null),
+    'Live2D',
+  );
+  assert.equal(
+    mod.detectMvWebGLReason('var $plugins = [{"name":"PictureSpine","status":false}];', null, null),
+    null,
+  );
+
+  // 2. Universal timestep stabilizer on MV <= 1.6.0 + TDDP_FluidTimestep (no _deltaTime, uses _dt / getTimeInMs)
+  let mockNow = 1000;
+  let updateSceneCalls = 0;
+  let renderSceneCalls = 0;
+  let measureCalls = 0;
+  let tintExecCalls = 0;
+
+  function MockSprite() {
+    this._blendColor = [0, 0, 0, 0];
+    this._colorTone = [0, 0, 0, 0];
+    this._bitmap = { _image: { width: 96, height: 96 }, baseTexture: { scaleMode: 0 } };
+    this._canvas = { width: 96, height: 96 };
+    this._context = {
+      globalCompositeOperation: 'source-over',
+      globalAlpha: 1,
+      fillStyle: '#000',
+      drawImage() {},
+      fillRect() {},
+    };
+    this.anchor = { x: 0, y: 0 };
+    this.scale = { x: 1, y: 1 };
+    this.children = [];
+  }
+  MockSprite.prototype.addChild = function (c) { c.parent = this; this.children.push(c); };
+  MockSprite.prototype.removeChild = function (c) {
+    const i = this.children.indexOf(c);
+    if (i >= 0) this.children.splice(i, 1);
+    c.parent = null;
+  };
+  MockSprite.prototype._refresh = function () {
+    this._createTinter(96, 96);
+    this._executeTint(0, 0, 96, 96);
+  };
+  MockSprite.prototype._createTinter = function (w, h) {
+    if (!this._canvas) { this._canvas = { width: w, height: h }; }
+    this._canvas.width = w;
+    this._canvas.height = h;
+    this._tintTexture = { width: w, height: h, scaleMode: 0 };
+  };
+  MockSprite.prototype._executeTint = function (x, y, w, h) {
+    const context = this._context;
+    context.drawImage(this._bitmap._image, x, y, w, h, 0, 0, w, h);
+  };
+  MockSprite.prototype.setBlendColor = function (color) {
+    if (!(color instanceof Array)) throw new Error('Argument must be an array');
+    if (this._blendColor.some((v, idx) => v !== color[idx])) {
+      this._blendColor = color.slice();
+      this._refresh();
+    }
+  };
+
+  function MockBitmap() {
+    this.fontFace = 'GameFont';
+    this.fontSize = 28;
+    this.fontItalic = false;
+  }
+  MockBitmap.prototype.measureTextWidth = function (text) {
+    measureCalls++;
+    return String(text).length * 14;
+  };
+
+  function MockGameCharacterBase() {}
+  MockGameCharacterBase.prototype.pos = function (x, y) { return this._x === x && this._y === y; };
+  MockGameCharacterBase.prototype.posNt = function (x, y) { return this.pos(x, y) && !this.isThrough(); };
+  MockGameCharacterBase.prototype.setPosition = function (x, y) { this._x = x; this._y = y; };
+  MockGameCharacterBase.prototype.moveStraight = function (d) {
+    if (d === 4) this._x--;
+    else if (d === 6) this._x++;
+    else if (d === 8) this._y--;
+    else if (d === 2) this._y++;
+  };
+
+  function MockGameCharacter() {}
+  MockGameCharacter.prototype = Object.create(MockGameCharacterBase.prototype);
+  MockGameCharacter.prototype.searchLimit = function () { return 12; };
+  // Stock MV reference A* implementation to test exact equivalence before and after installMvCompat
+  const stockFindDirectionTo = function (goalX, goalY) {
+    const searchLimit = this.searchLimit();
+    const mapWidth = perfRt.$gameMap.width();
+    const nodeList = [];
+    const openList = [];
+    const closedList = [];
+    const start = {};
+    let best = start;
+    if (this.x === goalX && this.y === goalY) return 0;
+    start.parent = null;
+    start.x = this.x;
+    start.y = this.y;
+    start.g = 0;
+    start.f = perfRt.$gameMap.distance(start.x, start.y, goalX, goalY);
+    nodeList.push(start);
+    openList.push(start.y * mapWidth + start.x);
+    while (openList.length > 0) {
+      let bestIndex = 0;
+      for (let i = 0; i < openList.length; i++) {
+        if (nodeList[i].f < nodeList[bestIndex].f) bestIndex = i;
+      }
+      const current = nodeList[bestIndex];
+      const x1 = current.x;
+      const y1 = current.y;
+      const pos1 = y1 * mapWidth + x1;
+      const g1 = current.g;
+      nodeList.splice(bestIndex, 1);
+      openList.splice(bestIndex, 1);
+      closedList.push(pos1);
+      if (current.x === goalX && current.y === goalY) { best = current; break; }
+      if (g1 >= searchLimit) continue;
+      for (let j = 0; j < 4; j++) {
+        const direction = 2 + j * 2;
+        const x2 = perfRt.$gameMap.roundXWithDirection(x1, direction);
+        const y2 = perfRt.$gameMap.roundYWithDirection(y1, direction);
+        const pos2 = y2 * mapWidth + x2;
+        if (closedList.includes(pos2)) continue;
+        if (!this.canPass(x1, y1, direction)) continue;
+        const g2 = g1 + 1;
+        const index2 = openList.indexOf(pos2);
+        if (index2 < 0 || g2 < nodeList[index2].g) {
+          let neighbor;
+          if (index2 >= 0) neighbor = nodeList[index2];
+          else { neighbor = {}; nodeList.push(neighbor); openList.push(pos2); }
+          neighbor.parent = current;
+          neighbor.x = x2;
+          neighbor.y = y2;
+          neighbor.g = g2;
+          neighbor.f = g2 + perfRt.$gameMap.distance(x2, y2, goalX, goalY);
+          if (!best || neighbor.f - neighbor.g < best.f - best.g) best = neighbor;
+        }
+      }
+    }
+    let node = best;
+    while (node.parent && node.parent !== start) node = node.parent;
+    const deltaX1 = perfRt.$gameMap.deltaX(node.x, start.x);
+    const deltaY1 = perfRt.$gameMap.deltaY(node.y, start.y);
+    if (deltaY1 > 0) return 2;
+    if (deltaX1 < 0) return 4;
+    if (deltaX1 > 0) return 6;
+    if (deltaY1 < 0) return 8;
+    const deltaX2 = this.deltaXFrom(goalX);
+    const deltaY2 = this.deltaYFrom(goalY);
+    if (Math.abs(deltaX2) > Math.abs(deltaY2)) return deltaX2 > 0 ? 4 : 6;
+    if (deltaY2 !== 0) return deltaY2 > 0 ? 8 : 2;
+    return 0;
+  };
+  MockGameCharacter.prototype.findDirectionTo = stockFindDirectionTo;
+
+  function MockGameMap() {
+    this._mapId = 1;
+    this._events = [];
+  }
+  MockGameMap.prototype.width = function () { return 20; };
+  MockGameMap.prototype.height = function () { return 15; };
+  MockGameMap.prototype.events = function () { return this._events.filter((e) => !!e); };
+  MockGameMap.prototype.eventsXy = function (x, y) { return this.events().filter((event) => event.pos(x, y)); };
+  MockGameMap.prototype.eventsXyNt = function (x, y) { return this.events().filter((event) => event.posNt(x, y)); };
+  MockGameMap.prototype.roundXWithDirection = function (x, d) { return x + (d === 6 ? 1 : d === 4 ? -1 : 0); };
+  MockGameMap.prototype.roundYWithDirection = function (y, d) { return y + (d === 2 ? 1 : d === 8 ? -1 : 0); };
+  MockGameMap.prototype.deltaX = function (x1, x2) { return x1 - x2; };
+  MockGameMap.prototype.deltaY = function (y1, y2) { return y1 - y2; };
+  MockGameMap.prototype.distance = function (x1, y1, x2, y2) { return Math.abs(x1 - x2) + Math.abs(y1 - y2); };
+
+  let decodeCalls = 0;
+  function MockWebAudio(url) {
+    this._url = url;
+    this._loadListeners = [];
+    this._load(url);
+  }
+  MockWebAudio._context = {
+    decodeAudioData(_arr, ok) {
+      decodeCalls++;
+      ok({ duration: 0.4, numberOfChannels: 2, length: 17640 });
+    },
+  };
+  MockWebAudio.prototype._load = function (url) {
+    const xhr = new globalThis.XMLHttpRequest();
+    xhr.open('GET', url);
+    xhr.responseType = 'arraybuffer';
+    xhr.onload = () => { this._onXhrLoad(xhr); };
+    xhr.send();
+  };
+  MockWebAudio.prototype._onXhrLoad = function (xhr) {
+    MockWebAudio._context.decodeAudioData(xhr.response, (buf) => {
+      this._buffer = buf;
+      this._onLoad();
+    });
+  };
+  MockWebAudio.prototype._onLoad = function () {
+    while (this._loadListeners.length > 0) this._loadListeners.shift()();
+  };
+
+  const perfSw = createMockSwitch({
+    'sdmc:/perf/www/audio/se/Step1.ogg': new Uint8Array([0x4f, 0x67, 0x67, 0x53]).buffer,
+  });
+  const perfAssets = mod.createAssetReader('sdmc:/perf/www', perfSw);
+  const perfHost = mod.createBrowserHost(perfAssets, (p, s) => s, fakeScreen, { gameTitle: 'PerfTest' });
+
+  const perfRt = {
+    document: globalThis.document,
+    Graphics: { width: 816, height: 624, frameCount: 1 },
+    Utils: {},
+    Decrypter: { hasEncryptedAudio: false },
+    WebAudio: MockWebAudio,
+    Bitmap: MockBitmap,
+    Sprite: MockSprite,
+    Game_CharacterBase: MockGameCharacterBase,
+    Game_Character: MockGameCharacter,
+    Game_Map: MockGameMap,
+    SceneManager: {
+      // Simulate Fear & Hunger (MV 1.6.0 + TDDP_FluidTimestep): NO _deltaTime, only _dt = 1/60 & getTimeInMs!
+      _dt: 1 / 60,
+      _t: 0,
+      _accumulator: 0,
+      _currentTime: 1000,
+      getTimeInMs: () => mockNow,
+      isSceneChanging: () => false,
+      updateInputData() {},
+      changeScene() {},
+      updateScene() { updateSceneCalls++; },
+      renderScene() { renderSceneCalls++; },
+      requestUpdate() {},
+      updateMain() { throw new Error('Legacy unguarded updateMain should have been replaced!'); },
+    },
+  };
+  const gMap = new MockGameMap();
+  perfRt.$gameMap = gMap;
+  for (let i = 1; i <= 40; i++) {
+    const ev = Object.create(MockGameCharacterBase.prototype);
+    ev._x = i % 10;
+    ev._y = Math.floor(i / 10);
+    ev.isThrough = () => (i % 2 === 0);
+    gMap._events[i] = ev;
+  }
+
+  mod.installMvCompat(perfRt, perfHost);
+
+  // Verify 200ms frame spike on TDDP_FluidTimestep caps at max 2 update ticks (never 12 ticks!)
+  mockNow = 1200;
+  perfRt.SceneManager.updateMain();
+  assert.equal(updateSceneCalls, 2, `Expected 2 capped ticks on 200ms spike, got ${updateSceneCalls}`);
+  assert.equal(renderSceneCalls, 1);
+  assert.ok(perfRt.SceneManager._t > 0.03, 'TDDP_FluidTimestep _t must advance');
+
+  // Verify VSync phase-lock at 16.0ms (within 2.5ms of 16.667ms) executes 1 steady tick
+  mockNow += 16;
+  perfRt.SceneManager.updateMain();
+  assert.equal(updateSceneCalls, 3);
+
+  // Verify O(1) spatial grid + mid-tick move invalidation
+  assert.equal(gMap.eventsXy(3, 1).length, 1);
+  assert.equal(gMap.eventsXyNt(3, 1).length, 1); // i=13 -> odd -> not through
+  assert.equal(gMap.eventsXyNt(2, 1).length, 0); // i=12 -> even -> through
+  gMap._events[13].moveStraight(6); // moves (3,1) -> (4,1) mid-frame!
+  assert.equal(gMap.eventsXy(3, 1).length, 0);
+  assert.equal(gMap.eventsXy(4, 1).length, 2);
+
+  // Verify zero-alloc Typed-Array A* matches stock MV A* around obstacles on every start/goal pair
+  const walls = new Set(['5,4', '5,5', '5,6', '4,6', '6,4']);
+  const chTest = Object.create(MockGameCharacter.prototype);
+  chTest.canPass = (x, y, d) => {
+    const nx = gMap.roundXWithDirection(x, d);
+    const ny = gMap.roundYWithDirection(y, d);
+    if (nx < 0 || nx >= 20 || ny < 0 || ny >= 15) return false;
+    return !walls.has(`${nx},${ny}`);
+  };
+  chTest.deltaXFrom = function (gx) { return this.x - gx; };
+  chTest.deltaYFrom = function (gy) { return this.y - gy; };
+  for (const [sx, sy, gx, gy] of [[2, 5, 8, 5], [5, 3, 5, 7], [7, 7, 3, 3], [5, 5, 5, 5], [1, 1, 18, 13]]) {
+    chTest.x = sx; chTest.y = sy;
+    const fastDir = chTest.findDirectionTo(gx, gy);
+    const refDir = stockFindDirectionTo.call(chTest, gx, gy);
+    assert.equal(fastDir, refDir, `A* mismatch for (${sx},${sy})->(${gx},${gy}): fast=${fastDir} vs stock=${refDir}`);
+  }
+
+  // Verify Bitmap.measureTextWidth memoization
+  const bmp = new MockBitmap();
+  assert.equal(bmp.measureTextWidth('Attack'), 84);
+  assert.equal(bmp.measureTextWidth('Attack'), 84);
+  assert.equal(bmp.measureTextWidth('Attack'), 84);
+  assert.equal(measureCalls, 1, 'Repeated measureTextWidth calls must hit JS cache');
+
+  // Verify Sprite flash alpha quantization & _executeTint memoization
+  const sp = new MockSprite();
+  const origDraw = sp._context.drawImage;
+  sp._context.drawImage = () => { tintExecCalls++; origDraw(); };
+  for (let a = 255; a >= 0; a -= 4) {
+    sp.setBlendColor([255, 255, 255, a]);
+  }
+  // 64 alpha updates (each _executeTint draws twice) would be 128 drawImage calls unoptimized; quantized <= 36!
+  assert.ok(tintExecCalls <= 36, `Expected quantized flash tint draws <= 36, got ${tintExecCalls}`);
+  assert.deepEqual(sp._blendColor, [255, 255, 255, 0]);
+
+  // Verify WebAudio decoded SE cache (2nd load hits cache with 0 decodeAudioData calls!)
+  const se1 = new MockWebAudio('audio/se/Step1.ogg');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(se1._buffer, 'First SE should decode');
+  assert.equal(decodeCalls, 1);
+  const se2 = new MockWebAudio('audio/se/Step1.ogg');
+  assert.equal(se2._buffer, se1._buffer, 'Cached SE must be ready synchronously on 2nd play');
+  assert.equal(decodeCalls, 1, 'Cached SE must not re-run decodeAudioData');
+
+  // Verify PixiJS v4 WebGL2 Bitmap.snap passes positional (w, h) to PIXI.RenderTexture.create (Nightmare Knight fix!)
+  {
+    let rtArgs = null;
+    let extractCalls = 0;
+    let canvasUpdates = 0;
+    const ctxDraws = [];
+    function NkBitmap(w, h) {
+      this.width = w;
+      this.height = h;
+      this._dirty = false;
+      this._baseTexture = { width: w, height: h, update() { canvasUpdates++; } };
+      this._context = {
+        save() {}, restore() {},
+        drawImage(src) { ctxDraws.push(src); },
+        fillRect() { ctxDraws.push('fillRect'); },
+      };
+    }
+    // PixiJS v4 MV: Bitmap#checkDirty uploads the canvas via baseTexture.update()
+    NkBitmap.prototype._setDirty = function () { this._dirty = true; };
+    NkBitmap.prototype.checkDirty = function () {
+      if (this._dirty) {
+        this._baseTexture.update();
+        this._dirty = false;
+      }
+    };
+    Object.defineProperty(NkBitmap.prototype, 'baseTexture', {
+      configurable: true,
+      get() { return this._baseTexture; },
+    });
+    NkBitmap.snap = () => { throw new Error('Should use WebGL zero-copy RenderTexture path!'); };
+
+    let glBufDataCalls = 0;
+    let glBufSubDataCalls = 0;
+    let nextBufId = 1;
+    const mockGlScreen = {
+      width: 1280,
+      height: 720,
+      getContext(type) {
+        if (type !== 'webgl2') return null;
+        return {
+          ARRAY_BUFFER: 0x8892,
+          ELEMENT_ARRAY_BUFFER: 0x8893,
+          FRAMEBUFFER: 0x8d40,
+          DRAW_FRAMEBUFFER: 0x8ca9,
+          SCISSOR_TEST: 0x0c11,
+          COLOR_BUFFER_BIT: 0x4000,
+          DEPTH_BUFFER_BIT: 0x0100,
+          STENCIL_BUFFER_BIT: 0x0400,
+          drawingBufferWidth: 1280,
+          drawingBufferHeight: 720,
+          createBuffer() { return { id: nextBufId++ }; },
+          deleteBuffer() {},
+          bindBuffer() {},
+          bufferData() { glBufDataCalls++; },
+          bufferSubData() { glBufSubDataCalls++; },
+          bindFramebuffer() {},
+          viewport() {},
+          scissor() {},
+          enable() {},
+          disable() {},
+          clearColor() {},
+          clear() {},
+          texImage2D() {},
+          texSubImage2D() {},
+          getError() { return 0; },
+          TEXTURE_2D: 0x0de1,
+          TEXTURE0: 0x84c0,
+          activeTexture() {},
+          bindTexture() {},
+          useProgram() {},
+        };
+      },
+    };
+    const nkHost = mod.createBrowserHost(perfAssets, (p, s) => s, mockGlScreen, {
+      gameTitle: 'NightmareKnight',
+      enableWebGL: true,
+    });
+    const gl = nkHost.ensureWebGLContext();
+
+    // Also include a mock Live2DCubismFramework.CubismRenderer_WebGL to test per-drawable VBO pooling!
+    function MockCubismRenderer() {
+      this.gl = gl;
+      this._bufferData = { vertex: null, uv: null, index: null };
+    }
+    MockCubismRenderer.prototype.drawMesh = function (_t, _ic, _vc, idxArr, vertArr, uvArr) {
+      if (!this._bufferData.vertex) this._bufferData.vertex = this.gl.createBuffer();
+      this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this._bufferData.vertex);
+      this.gl.bufferData(this.gl.ARRAY_BUFFER, vertArr, 0x88e8);
+      if (!this._bufferData.uv) this._bufferData.uv = this.gl.createBuffer();
+      this.gl.bindBuffer(this.gl.ARRAY_BUFFER, this._bufferData.uv);
+      this.gl.bufferData(this.gl.ARRAY_BUFFER, uvArr, 0x88e8);
+      if (!this._bufferData.index) this._bufferData.index = this.gl.createBuffer();
+      this.gl.bindBuffer(this.gl.ELEMENT_ARRAY_BUFFER, this._bufferData.index);
+      this.gl.bufferData(this.gl.ELEMENT_ARRAY_BUFFER, idxArr, 0x88e8);
+    };
+
+    // Minimal PIXI v4 WebGLRenderer for the sprite-batch slot resync (Live2D white boxes)
+    const glTexWindow = { name: 'windowBack' };
+    const texWindow = { _glTextures: { 0: { texture: glTexWindow } } };
+    const emptyTex = [{ empty: 0 }, { empty: 1 }];
+    const pixiProgram = { name: 'pixiSprite' };
+    let spriteFlushes = 0;
+    const nkRenderer = {
+      gl,
+      type: 1,
+      CONTEXT_UID: 0,
+      boundTextures: [texWindow, emptyTex[1]],
+      emptyTextures: emptyTex,
+      _activeShader: { program: pixiProgram },
+      state: { activeState: [1, 0, 0, 0, 0] },
+      bindShader() {},
+      bindTexture() {},
+      plugins: { sprite: { flush() { spriteFlushes++; } } },
+    };
+    let coreUpdates = 0;
+    function MockCubismModel() {}
+    MockCubismModel.prototype.update = function () { coreUpdates++; };
+
+    const nkRt = {
+      document: globalThis.document,
+      Graphics: {
+        width: 1280,
+        height: 720,
+        frameCount: 10,
+        _createRenderer() { this._renderer = nkRenderer; },
+        _renderer: {
+          render() {},
+          extract: { canvas() { extractCalls++; return { width: 1280, height: 720, tag: 'rt-pixels' }; } },
+        },
+      },
+      PIXI: {
+        VERSION: '4.5.4', // PixiJS v4: RenderTexture.create(width, height) requires numbers, NOT { width, height }!
+        RenderTexture: {
+          create(w, h) {
+            rtArgs = [w, h];
+            assert.equal(typeof w, 'number', 'PixiJS v4 RenderTexture.create first arg must be numeric width!');
+            assert.equal(typeof h, 'number', 'PixiJS v4 RenderTexture.create second arg must be numeric height!');
+            return {
+              baseTexture: {
+                width: w,
+                height: h,
+                destroyed: false,
+                source: null,
+                // Real PixiJS v4 BaseRenderTexture has no image source: update() reads source.naturalWidth
+                update() { return this.source.naturalWidth; },
+              },
+              destroy() {},
+            };
+          },
+        },
+      },
+      Bitmap: NkBitmap,
+      SceneManager: {},
+      Live2DCubismFramework: { CubismRenderer_WebGL: MockCubismRenderer, CubismModel: MockCubismModel },
+    };
+
+    mod.installMvCompat(nkRt, nkHost, { live2dUpdateRate: 'half' });
+
+    const snapped = NkBitmap.snap({ children: [] });
+    assert.deepEqual(rtArgs, [1280, 720]);
+    assert.equal(snapped.baseTexture.width, 1280);
+    assert.equal(snapped.baseTexture.height, 720);
+
+    // Dirty flag on the GPU-backed snapshot must not reach RenderTexture.baseTexture.update()
+    // (crashed Nightmare Knight on Continue / New Game and Lilialette's ring menu)
+    snapped._setDirty();
+    assert.doesNotThrow(() => snapped.checkDirty());
+    assert.equal(extractCalls, 0, 'zero-copy snapshot must not read back until drawn on');
+    // A plugin drawing on the snapshot converts it into a normal canvas bitmap holding the scene pixels
+    snapped._context.fillRect(0, 0, 10, 10);
+    assert.equal(extractCalls, 1);
+    assert.equal(ctxDraws[0].tag, 'rt-pixels', 'scene pixels copied into the canvas before the game draws');
+    assert.equal(ctxDraws[1], 'fillRect');
+    assert.notEqual(snapped.baseTexture.source, null);
+    assert.equal(typeof snapped.baseTexture.update, 'function');
+    assert.doesNotThrow(() => snapped.checkDirty());
+    assert.ok(canvasUpdates >= 1, 'converted snapshot uploads its canvas texture');
+    // The converted bitmap now owns its pixels and is never handed out again as the snapshot target
+    const snapped2 = NkBitmap.snap({ children: [] });
+    assert.notEqual(snapped2, snapped);
+
+    // Live2D 'half' rate: Cubism Core deforms each model on every other presented frame
+    const l2dModel = new MockCubismModel();
+    for (let f = 1; f <= 6; f++) {
+      nkRt.__drRenderFrame = f;
+      l2dModel.update();
+    }
+    assert.equal(coreUpdates, 3, 'half rate runs csmUpdateModel on frames 1, 3, 5');
+    nkRt.__drRenderFrame = 6;
+    l2dModel.update(); // a second call in a frame that skipped still skips (no catch-up burst)
+    assert.equal(coreUpdates, 3);
+    nkRt.__drRenderFrame = 7;
+    l2dModel.update();
+    l2dModel.update(); // repeated call within an updated frame still runs
+    assert.equal(coreUpdates, 5);
+    const otherModel = new MockCubismModel();
+    nkRt.__drRenderFrame = 8;
+    otherModel.update(); // a model's first update always runs
+    assert.equal(coreUpdates, 6);
+
+    // Sprite batch flush resyncs PIXI's cached texture slots after a foreign (Live2D) GL draw
+    nkRt.Graphics._createRenderer();
+    assert.equal(nkRenderer.plugins.sprite.__drSlotSync, true);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, glTexWindow);
+    gl.useProgram(pixiProgram);
+    nkRenderer.plugins.sprite.flush();
+    assert.equal(nkRenderer.boundTextures[0], texWindow, 'still bound -> cache kept');
+    assert.equal(nkRenderer.state.activeState[4], 0, 'PIXI program still active -> blend cache kept');
+    gl.bindTexture(gl.TEXTURE_2D, { name: 'live2dAtlas' }); // Live2D Cubism draws with its own texture...
+    gl.useProgram({ name: 'cubismProgram' }); // ...and program
+    nkRenderer.plugins.sprite.flush();
+    assert.equal(nkRenderer.boundTextures[0], emptyTex[0], 'stale slot dropped so PIXI rebinds the window texture');
+    assert.equal(nkRenderer.state.activeState[4], -1, 'blend func cache invalidated after foreign GL program');
+    assert.equal(spriteFlushes, 2);
+
+    // Quick Menu "Log On-Screen Objects" walks the scene graph without throwing
+    const bigBounds = { x: 0, y: 400, width: 816, height: 224 };
+    function Window_Message() {}
+    const fakeWin = Object.assign(new Window_Message(), {
+      visible: true, worldAlpha: 1, alpha: 1, renderable: true, opacity: 255, backOpacity: 192,
+      contentsOpacity: 255, openness: 255, _windowskin: { _url: 'img/system/Window.png' },
+      getBounds: () => bigBounds, children: [],
+    });
+    nkRt.SceneManager._scene = {
+      constructor: { name: 'Scene_Map' }, visible: true, worldAlpha: 1, alpha: 1,
+      getBounds: () => ({ x: 0, y: 0, width: 816, height: 624 }),
+      children: [fakeWin, { visible: false, worldAlpha: 1, children: [] }],
+    };
+    assert.equal(typeof nkRt.__drDumpScene, 'function');
+    assert.doesNotThrow(() => nkRt.__drDumpScene());
+
+    // Test Live2D per-drawable VBO pool across 2 frames:
+    // Frame 1: allocates vertex + uv + index once (3 bufferData calls).
+    // Frame 2: 0 bufferData calls, 0 uv/index uploads, and only 1 bufferSubData call (even if drawn twice in mask + color pass!).
+    const cubism = new MockCubismRenderer();
+    const wasmHeap = new ArrayBuffer(1024);
+    const idxView = new Uint16Array(wasmHeap, 64, 6);
+    const vertView = new Float32Array(wasmHeap, 128, 8);
+    const uvView = new Float32Array(wasmHeap, 256, 8);
+    nkHost.beginFrame();
+    cubism.drawMesh(0, 6, 4, idxView, vertView, uvView, 1, 0, false);
+    assert.equal(glBufDataCalls, 3, 'Frame 1 must initialize vertex, uv, and index buffers once');
+    assert.equal(glBufSubDataCalls, 0);
+
+    nkHost.beginFrame();
+    // Simulate mask pass + color pass of the same drawable in Frame 2:
+    cubism.drawMesh(0, 6, 4, idxView, vertView, uvView, 1, 0, false);
+    cubism.drawMesh(0, 6, 4, idxView, vertView, uvView, 1, 0, false);
+    assert.equal(glBufDataCalls, 3, 'Frame 2 must make ZERO gl.bufferData re-allocations!');
+    assert.equal(glBufSubDataCalls, 1, 'Frame 2 must update vertex VBO once via bufferSubData and skip static uv/index!');
+  }
+
+  // Verify YEP_X_MoreQuests malformed separator guard & Live2D string-table constant folder in createScriptPreparer
+  {
+    const prep = mod.createScriptPreparer();
+    const questSafe = prep(
+      'js/plugins/YEP_X_MoreQuests1.js',
+      "DataManager.questDatabaseCreate = function() { var i = 101; var questData = JSON.parse(Yanfly.Parameters['Quest ' + i] || 'null'); return questData; };",
+    );
+    const qCtx = { DataManager: {}, Yanfly: { Parameters: { 'Quest 101': '---Separator---' } } };
+    new Function('DataManager', 'Yanfly', questSafe)(qCtx.DataManager, qCtx.Yanfly);
+    assert.equal(qCtx.DataManager.questDatabaseCreate(), null, 'Malformed separator in Quest parameter must safely return null');
+  }
+
+  // Verify OMORI YED_Tiled (`TiledTilemap extends ShaderTilemap` without `lowerZLayer`/`upperZLayer`)
+  // delegates cleanly to stock `ShaderTilemap.prototype.updateTransform` while stock `ShaderTilemap` still uses incremental paint
+  {
+    let stockPaintCalls = 0;
+    let tiledPaintCalls = 0;
+    let tiledPosCalls = 0;
+    function MockContainer() {}
+    MockContainer.prototype.updateTransform = function () {};
+    function MockShaderTilemap() {
+      this.roundPixels = true;
+      this.origin = { x: 0, y: 0 };
+      this._margin = 20;
+      this._tileWidth = 32;
+      this._tileHeight = 32;
+      this._width = 640;
+      this._height = 480;
+      this._needsRepaint = true;
+      this.lowerZLayer = { position: { x: 0, y: 0 }, clear() {} };
+      this.upperZLayer = { position: { x: 0, y: 0 }, clear() {} };
+      this.lowerLayer = { children: [] };
+      this.upperLayer = { children: [] };
+    }
+    MockShaderTilemap.prototype = Object.create(MockContainer.prototype);
+    MockShaderTilemap.prototype.constructor = MockShaderTilemap;
+    MockShaderTilemap.prototype._sortChildren = function () {};
+    MockShaderTilemap.prototype._updateLayerPositions = function () {
+      this.lowerZLayer.position.x = 0;
+      this.upperZLayer.position.y = 0;
+    };
+    MockShaderTilemap.prototype._paintTiles = function (_sx, _sy, _x, _y) {};
+    MockShaderTilemap.prototype._paintAllTiles = function (startX, startY) {
+      this.lowerZLayer.clear();
+      this.upperZLayer.clear();
+      for (let y = 0; y < 2; y++) {
+        for (let x = 0; x < 2; x++) this._paintTiles(startX, startY, x, y);
+      }
+      stockPaintCalls++;
+    };
+    MockShaderTilemap.prototype.updateTransform = function () {
+      const ox = this.roundPixels ? Math.floor(this.origin.x) : this.origin.x;
+      const oy = this.roundPixels ? Math.floor(this.origin.y) : this.origin.y;
+      const startX = Math.floor((ox - this._margin) / this._tileWidth);
+      const startY = Math.floor((oy - this._margin) / this._tileHeight);
+      this._updateLayerPositions(startX, startY);
+      if (this._needsRepaint || this._lastStartX !== startX || this._lastStartY !== startY) {
+        this._lastStartX = startX;
+        this._lastStartY = startY;
+        this._paintAllTiles(startX, startY);
+        this._needsRepaint = false;
+      }
+      this._sortChildren();
+      MockContainer.prototype.updateTransform.call(this);
+    };
+
+    // Subclass matching OMORI's `YED_Tiled` `TiledTilemap`: inherits `updateTransform`, NO `lowerZLayer`/`upperZLayer`!
+    function MockTiledTilemap() {
+      this.roundPixels = true;
+      this.origin = { x: 0, y: 0 };
+      this._margin = 20;
+      this._tileWidth = 32;
+      this._tileHeight = 32;
+      this._width = 640;
+      this._height = 480;
+      this._needsRepaint = true;
+      this._layers = [{ position: { x: 0, y: 0 }, clear() {} }];
+    }
+    MockTiledTilemap.prototype = Object.create(MockShaderTilemap.prototype);
+    MockTiledTilemap.prototype.constructor = MockTiledTilemap;
+    MockTiledTilemap.prototype._updateLayerPositions = function () { tiledPosCalls++; };
+    MockTiledTilemap.prototype._paintTiles = function (_layer, _sx, _sy) {};
+    MockTiledTilemap.prototype._paintAllTiles = function (startX, startY) {
+      tiledPaintCalls++;
+      for (const l of this._layers) {
+        l.clear();
+        this._paintTiles(l, startX, startY);
+      }
+    };
+
+    const tmRt = {
+      document: globalThis.document,
+      Graphics: { width: 640, height: 480, frameCount: 1 },
+      PIXI: { Container: MockContainer },
+      ShaderTilemap: MockShaderTilemap,
+      SceneManager: {},
+    };
+    mod.installMvCompat(tmRt, perfHost);
+    assert.equal(MockShaderTilemap.prototype.__drIncPaint, true, 'Incremental tilemap painter must install');
+
+    // Stock ShaderTilemap uses incremental paint (scrolling 1 tile does NOT call _paintAllTiles again)
+    const stockTm = new MockShaderTilemap();
+    stockTm.updateTransform();
+    assert.equal(stockPaintCalls, 1);
+    stockTm.origin.x = 32;
+    stockTm.updateTransform();
+    assert.equal(stockPaintCalls, 1, 'Stock ShaderTilemap must scroll incrementally without full repaint');
+
+    // OMORI TiledTilemap subclass runs without crashing on missing lowerZLayer/upperZLayer
+    const omoriTiledTm = new MockTiledTilemap();
+    assert.doesNotThrow(() => omoriTiledTm.updateTransform());
+    assert.equal(tiledPosCalls, 1);
+    assert.equal(tiledPaintCalls, 1);
+    omoriTiledTm.origin.x = 32;
+    assert.doesNotThrow(() => omoriTiledTm.updateTransform());
+    assert.equal(tiledPosCalls, 2);
+    assert.equal(tiledPaintCalls, 2);
+  }
+
+  // Verify OMORI YED_Tiled fast-paths:
+  // 1) Sprite_CharacterReflect skips full Sprite_Character.update when reflections.length === 0
+  // 2) YED_Tiled updateReflection avoids per-tick Array allocation & caches isHalfTile()
+  // 3) O(N) nearly-sorted Tilemap._sortChildren matches stock order without .bind() allocations
+  // 4) Direct-to-GPU RectTileLayer.renderCanvas draws directly to renderer.context (no CPU offscreen canvas upload)
+  {
+    let baseCharUpdates = 0;
+    function MockGameEvent() {
+      this.reflections = [];
+      this._transparent = false;
+      this._characterName = 'DW_NPC';
+      this._characterIndex = 0;
+      this._tileId = 0;
+      this._opacity = 255;
+      this._blendMode = 0;
+      this._realX = 5;
+      this._realY = 5;
+    }
+    function MockSpriteChar(ch) {
+      this._character = ch;
+      this.visible = true;
+      this.children = [];
+      this.scale = { x: 1, y: 1 };
+    }
+    MockSpriteChar.prototype.update = function () {
+      baseCharUpdates++;
+      this.visible = !this._character._transparent;
+    };
+    MockSpriteChar.prototype.updateTransform = function () {};
+
+    function MockSpriteCharReflect(ch) {
+      MockSpriteChar.call(this, ch);
+      this.visible = false;
+    }
+    MockSpriteCharReflect.prototype = Object.create(MockSpriteChar.prototype);
+    MockSpriteCharReflect.prototype.constructor = MockSpriteCharReflect;
+    MockSpriteCharReflect.prototype.update = function () {
+      MockSpriteChar.prototype.update.call(this);
+      this.updateReflect();
+    };
+    MockSpriteCharReflect.prototype.updateReflect = function () {
+      this.visible = this._character.reflections.length > 0;
+      const r = this._character.reflections[0];
+      if (!r) return;
+      this.scale.y = r.reflectionCast > 0 ? -1 : 1;
+      this.opacity = r.reflectionOpacity || 255;
+    };
+
+    let halfTileLookups = 0;
+    function MockCharBase() {
+      this._realX = 2;
+      this._realY = 3;
+      this.reflections = [];
+    }
+    MockCharBase.prototype.updateReflection = function () {
+      if (!omoriRt.$gameMap.isOnReflection(this)) {
+        this.reflections = [];
+        return;
+      }
+      this.reflections = omoriRt.$gameMap.getReflections(this);
+    };
+    function MockYedMap() {
+      this._reflection = [];
+    }
+    MockYedMap.prototype.isTiledMap = () => true;
+    MockYedMap.prototype.tileWidth = function () { return this.isHalfTile() ? 16 : 32; };
+    MockYedMap.prototype.tileHeight = function () { return this.isHalfTile() ? 16 : 32; };
+    MockYedMap.prototype.isHalfTile = function () {
+      halfTileLookups++;
+      const pluginParams = { 'Half-tile movement': 'false' };
+      return pluginParams['Half-tile movement'].toLowerCase() === 'true';
+    };
+
+    function MockTilemapSort() {
+      this.children = [];
+    }
+    MockTilemapSort.prototype._sortChildren = function () {
+      this.children.sort(this._compareChildOrder.bind(this));
+    };
+    MockTilemapSort.prototype._compareChildOrder = function (a, b) {
+      if (a.z !== b.z) return a.z - b.z;
+      else if (a.y !== b.y) return a.y - b.y;
+      else return a.spriteId - b.spriteId;
+    };
+
+    let rendererBlits = 0;
+    function MockRectTileLayer() {
+      this.pointsBuf = [];
+      this.textures = [{ baseTexture: { source: { width: 256, height: 256 }, width: 256, height: 256, hasLoaded: true } }];
+      this.hasAnim = false;
+    }
+    MockRectTileLayer.prototype.renderCanvas = function (renderer) {
+      const points = this.pointsBuf;
+      renderer.context.fillStyle = '#000000';
+      for (let i = 0; i < points.length; i += 9) {
+        renderer.context.drawImage(this.textures[0].baseTexture.source, points[i], points[i + 1], 32, 32, points[i + 2], points[i + 3], 32, 32);
+      }
+    };
+
+    const yedMap = new MockYedMap();
+    const omoriRt = {
+      Graphics: { width: 640, height: 480, frameCount: 1 },
+      PIXI: { tilemap: { RectTileLayer: MockRectTileLayer } },
+      Game_CharacterBase: MockCharBase,
+      Game_Event: MockGameEvent,
+      Game_Map: MockYedMap,
+      Sprite_Character: MockSpriteChar,
+      Tilemap: MockTilemapSort,
+      $gameMap: yedMap,
+      SceneManager: {},
+    };
+    mod.installMvCompat(omoriRt, { isDirectGpu: () => true, getWebGLContext: () => null }, {});
+
+    // 1) Sprite_CharacterReflect: 1st sprite patches prototype once, then 0 base updates when reflections is empty!
+    const ev1 = new MockGameEvent();
+    const ev2 = new MockGameEvent();
+    const ref1 = new MockSpriteCharReflect(ev1);
+    const ref2 = new MockSpriteCharReflect(ev2);
+    ref1.update(); // patches MockSpriteCharReflect.prototype.update on 1st call
+    assert.equal(baseCharUpdates, 1);
+    assert.equal(ref1.visible, false);
+    for (let t = 0; t < 10; t++) {
+      ref1.update();
+      ref2.update();
+    }
+    assert.equal(baseCharUpdates, 1, 'Inactive Sprite_CharacterReflect sprites must skip Sprite_Character.update');
+    // Stepping onto a reflection immediately wakes Sprite_CharacterReflect up
+    ev2.reflections = [{ reflectionCast: 1, reflectionOpacity: 180 }];
+    ref2.update();
+    assert.equal(baseCharUpdates, 2, 'Active reflection must run full Sprite_CharacterReflect update');
+    assert.equal(ref2.visible, true);
+    assert.equal(ref2.scale.y, -1);
+    assert.equal(ref2.opacity, 180);
+
+    // 2) updateReflection reuses shared empty array & caches isHalfTile
+    const cb = new MockCharBase();
+    cb.updateReflection();
+    const emptyRef1 = cb.reflections;
+    cb.updateReflection();
+    assert.equal(cb.reflections, emptyRef1, 'updateReflection must reuse shared empty array when off reflections');
+    yedMap._reflection.push({ rect: { x: 60, y: 90, width: 32, height: 32 }, reflectionCast: 1, reflectionOpacity: 200 });
+    cb.updateReflection();
+    assert.equal(cb.reflections.length, 1);
+    assert.equal(halfTileLookups, 1, 'isHalfTile must cache boolean instead of calling toLowerCase() every query');
+
+    // 3) O(N) Tilemap._sortChildren preserves exact z -> y -> spriteId order
+    const tmSort = new MockTilemapSort();
+    tmSort.children = [
+      { z: 3, y: 200, spriteId: 5 },
+      { z: 1, y: 400, spriteId: 2 },
+      { z: 3, y: 120, spriteId: 9 },
+      { z: 3, y: 120, spriteId: 4 },
+    ];
+    tmSort._sortChildren();
+    assert.deepEqual(
+      tmSort.children.map((c) => c.spriteId),
+      [2, 4, 9, 5],
+      'Tilemap._sortChildren must sort by z, then y, then spriteId',
+    );
+    // Small single-character y movement uses fast insertion sort
+    tmSort.children[3].y = 100;
+    tmSort._sortChildren();
+    assert.deepEqual(tmSort.children.map((c) => c.spriteId), [2, 5, 4, 9]);
+
+    // 4) Direct-to-GPU RectTileLayer.renderCanvas draws directly to renderer.context without setting fillStyle
+    const layer = new MockRectTileLayer();
+    for (let i = 0; i < 10; i++) {
+      layer.pointsBuf.push(0, 0, i * 32, 0, 32, 32, 0, 0, 0);
+    }
+    let fillStyleSets = 0;
+    const fakeRenderer = {
+      plugins: { tilemap: { tileAnim: [0, 0] } },
+      context: {
+        set fillStyle(_v) { fillStyleSets++; },
+        drawImage() { rendererBlits++; },
+      },
+    };
+    layer.renderCanvas(fakeRenderer);
+    assert.equal(rendererBlits, 10, 'Direct-to-GPU RectTileLayer must draw tiles directly from cached Image source');
+    assert.equal(fillStyleSets, 0, 'Must not set CSS fillStyle on normal textured tile layers');
+  }
+
+  // Verify Noel liply_MobileLight (`spriteset._lightMask` half-res + radial gradient cache + throttle)
+  // and Node crypto AES-256-GCM (KageDesu PKD Protector 2) & AES-256-CBC round-trips
+  {
+    const ncTarget = {};
+    mod.installNodeCompat(ncTarget, null, 'sdmc:/switch/SW2RPGMGL/games/PKDTest/www', 'sdmc:/switch/SW2RPGMGL/games/PKDTest/save');
+    const cMod = ncTarget.require('crypto');
+    const nodeCrypto = await import('node:crypto');
+
+    // AES-256-GCM encrypt in real Node crypto -> decrypt in Switch 2 node-compat (PKD Protector 2 / RmmzEncripterTool)
+    const gcmKey = nodeCrypto.randomBytes(32);
+    const gcmIv = nodeCrypto.randomBytes(12);
+    const gcmPlain = Buffer.from('var PKD_ProtectedPlugin = { ok: 42 }; // KageDesu PKD Protector 2 test!', 'utf8');
+    const realGcmEnc = nodeCrypto.createCipheriv('aes-256-gcm', gcmKey, gcmIv);
+    const gcmCt = Buffer.concat([realGcmEnc.update(gcmPlain), realGcmEnc.final()]);
+    const gcmTag = realGcmEnc.getAuthTag();
+
+    const shimGcmDec = cMod.createDecipheriv('aes-256-gcm', gcmKey, gcmIv);
+    shimGcmDec.setAuthTag(gcmTag);
+    const gcmOut = ncTarget.Buffer.concat([shimGcmDec.update(gcmCt), shimGcmDec.final()]);
+    assert.equal(gcmOut.toString('utf8'), gcmPlain.toString('utf8'), 'AES-256-GCM must decrypt & verify authTag');
+
+    // AES-256-CBC encrypt in real Node crypto -> decrypt in Switch 2 node-compat
+    const cbcIv = nodeCrypto.randomBytes(16);
+    const realCbcEnc = nodeCrypto.createCipheriv('aes-256-cbc', gcmKey, cbcIv);
+    const cbcCt = Buffer.concat([realCbcEnc.update(gcmPlain), realCbcEnc.final()]);
+    const shimCbcDec = cMod.createDecipheriv('aes-256-cbc', gcmKey, cbcIv);
+    const cbcOut = ncTarget.Buffer.concat([shimCbcDec.update(cbcCt), shimCbcDec.final()]);
+    assert.equal(cbcOut.toString('utf8'), gcmPlain.toString('utf8'), 'AES-256-CBC must decrypt & unpad PKCS#7');
+
+    // Zero-copy MiniBuffer.slice view semantics (matches Node Buffer.prototype.slice)
+    const zBuf = ncTarget.Buffer.from([10, 20, 30, 40]);
+    const zSlice = zBuf.slice(1, 3);
+    assert.equal(zSlice.length, 2);
+    assert.equal(zSlice[0], 20);
+    zSlice[0] = 99;
+    assert.equal(zBuf[1], 99, 'MiniBuffer.slice must share underlying ArrayBuffer memory like Node Buffer.slice');
+  }
+
+  console.log('[PASS] MV Performance fast-paths (Spine WebGL2, Pixi v4 snap, OMORI TiledTilemap & RectTileLayer bake, Noel liply_MobileLight, PKD AES-GCM/CBC, Live2D VBO pool & constant folder, O(1) spatial grid, Typed-Array A*, SE cache)');
+}
+
+// 18. Verify Haven / VisuStella MZ hoisted _0x string-table folding + MZ runtime fast-paths + DomNode.style.font
+{
+  // A) Hoisted VisuStella MZ `_0x` string-table folding (with outer alias before rotation IIFE,
+  //    `instanceof` trailing-space guard, split-string bracket concat, and quoted hex args)
+  const visuLikePlugin = [
+    'var VisuMZ = VisuMZ || {};',
+    'const _0x2057f9=_0x1960;(function(_0x3ac999,_0x534bc0){const _0x3e95a5=_0x1960,_0x4aab50=_0x3ac999();while(!![]){try{const _0x17ae4b=parseInt(_0x3e95a5(0x100))/0x1+parseInt(_0x3e95a5(0x101))/0x2;if(_0x17ae4b===_0x534bc0)break;else _0x4aab50.push(_0x4aab50.shift());}catch(_0xe1){_0x4aab50.push(_0x4aab50.shift());}}}(_0x3fef,0x3));',
+    'VisuMZ.check = function(sm, Scene_Map) { const _0xa1 = _0x2057f9; return sm[_0xa1(0x102)]instanceof Scene_Map && sm[_0xa1(0x103) + _0xa1(\'0x104\')] === 42; };',
+    'function _0x3fef(){const _0xa2b3=["zoom","Scale","1a","4b","_scene"];_0x3fef=function(){return _0xa2b3;};return _0x3fef();}',
+    'function _0x1960(_0x10,_0x20){const _0xd1=_0x3fef();return _0x1960=function(_0xe2,_0xf3){_0xe2=_0xe2-0x100;let _0xc4=_0xd1[_0xe2];return _0xc4;},_0x1960(_0x10,_0x20);}',
+  ].join('\n');
+
+  const foldedVisu = mod.foldObfuscatedStringTable(visuLikePlugin, 'js/plugins/VisuMZ_Test.js');
+  assert.ok(foldedVisu.includes('sm._scene instanceof Scene_Map'), 'Must fold hoisted _0x table & preserve space before instanceof');
+  assert.ok(foldedVisu.includes('sm.zoomScale === 42'), 'Must fold split-string bracket access & quoted hex arg into dot property');
+  assert.ok(!foldedVisu.includes('while(!![])'), 'Must pre-bake rotated array and elide startup rotation IIFE');
+  const visuCtx = {};
+  new Function('VisuMZ', foldedVisu + '\nreturn VisuMZ;')(visuCtx);
+  function DummySceneMap() {}
+  assert.equal(visuCtx.check({ _scene: new DummySceneMap(), zoomScale: 42 }, DummySceneMap), true);
+
+  // A2) Comma-grouped rotation IIFE (`(function(a,b){...}(_0xTable, expr), mainBody)`) used by NEO_CTB / NEO_ConquestCardGame
+  const commaGroupedPlugin = [
+    'var NEO = {};',
+    'function _0x2912(_0xa,_0xb){_0xa=_0xa-0x100;const _0xt=_0x53e6();return _0xt[_0xa];}',
+    'function _0x53e6(){const _0xc=["hello","1a","4b"];_0x53e6=function(){return _0xc;};return _0x53e6();}',
+    '(function(_0xd,_0xe){const _0xf=_0x2912,_0x11=_0xd();while(!![]){try{const _0x12=parseInt(_0xf(0x100))/0x1+parseInt(_0xf(0x101))/0x2;if(_0x12===_0xe)break;else _0x11.push(_0x11.shift());}catch(_0x13){_0x11.push(_0x11.shift());}}}(_0x53e6,0x1+0x2),NEO[_0x2912(0x102)]=99);',
+  ].join('\n');
+  const foldedComma = mod.foldObfuscatedStringTable(commaGroupedPlugin, 'js/plugins/NEO_CTB.js');
+  assert.ok(foldedComma.includes('NEO.hello=99'), 'Must fold comma-grouped rotation IIFE without eating trailing plugin body');
+  const neoCtx = {};
+  new Function('NEO', foldedComma.replace('var NEO = {};', '') + '\nreturn NEO;')(neoCtx);
+  assert.equal(neoCtx.hello, 99);
+
+  // B) DomNode.style.font shorthand parser (`OpenTypePixelFont.js` compatibility)
+  const prevScreen = globalThis.screen;
+  globalThis.screen = { width: 1280, height: 720, addEventListener() {}, removeEventListener() {}, getContext() { return { canvas: { width: 1280, height: 720 } }; } };
+  try {
+    const host = mod.createBrowserHost(
+      { async read() { return null; }, async exists() { return false; } },
+      (_p, s) => s,
+      globalThis.screen,
+      { gameTitle: 'FontStyleTest', enableWebGL: false },
+    );
+    void host;
+    const pEl = globalThis.document.createElement('p');
+    pEl.style.font = 'italic bold 26px "rmmz-mainfont", sans-serif';
+    assert.equal(pEl.style.fontStyle, 'italic');
+    assert.equal(pEl.style.fontWeight, 'bold');
+    assert.equal(pEl.style.fontSize, '26px');
+    assert.equal(pEl.style.fontFamily.replace(/['"]/g, '').split(',')[0].trim(), 'rmmz-mainfont');
+  } finally {
+    globalThis.screen = prevScreen;
+  }
+
+  // C) MZ Tilemap.Layer flat Float32Array VBO + Tilemap 30-frame skip + _sortChildren + WindowLayer zero-alloc render
+  let uploadedVertexLen = 0;
+  let glDraws = 0;
+  let gfxCreated = 0;
+  let stencilClears = 0;
+
+  function MockMzLayer() {
+    this._elements = [];
+    this._indexArray = new Float32Array(0);
+    this._vertexArray = new Float32Array(0);
+    this._indexBuffer = { update() {} };
+    this._vertexBuffer = { update(arr) { uploadedVertexLen = arr.length; } };
+    this._vao = {};
+    this._images = [];
+    this._state = {};
+    this._needsTexturesUpdate = false;
+    this._needsVertexUpdate = false;
+    this.worldTransform = {};
+  }
+  MockMzLayer.VERTEX_STRIDE = 36;
+  MockMzLayer.prototype.clear = function () { this._elements.length = 0; this._needsVertexUpdate = true; };
+  MockMzLayer.prototype.size = function () { return this._elements.length; };
+  MockMzLayer.prototype.addRect = function (sn, sx, sy, dx, dy, w, h) { this._elements.push([sn, sx, sy, dx, dy, w, h]); };
+  MockMzLayer.prototype._updateIndexBuffer = function () {};
+  MockMzLayer.prototype._updateVertexBuffer = function () {
+    const req = this._elements.length * 36;
+    if (this._vertexArray.length < req) this._vertexArray = new Float32Array(req * 2);
+    this._vertexBuffer.update(this._vertexArray);
+  };
+  MockMzLayer.prototype.render = function (renderer) {
+    const tilemapRenderer = renderer.plugins.rpgtilemap;
+    if (this._needsVertexUpdate) { this._updateVertexBuffer(); this._needsVertexUpdate = false; }
+    void tilemapRenderer;
+    glDraws++;
+  };
+
+  let addAllSpotsCalls = 0;
+  let spotTileInnerCalls = 0;
+  function MockMzTilemap() {
+    this.origin = { x: 0, y: 0 };
+    this._margin = 20;
+    this._tileWidth = 48;
+    this._tileHeight = 48;
+    this._lastStartX = -1;
+    this._lastStartY = -1;
+    this._lastAnimationFrame = 0;
+    this.animationFrame = 0;
+    this._needsRepaint = true;
+    this.children = [];
+  }
+  MockMzTilemap.Layer = MockMzLayer;
+  MockMzTilemap.prototype.refresh = function () { this._needsRepaint = true; };
+  MockMzTilemap.prototype._addAutotile = function (_layer, _tileId, _dx, _dy) {};
+  MockMzTilemap.prototype._addSpotTile = function (_tileId, _dx, _dy) { spotTileInnerCalls++; };
+  MockMzTilemap.prototype._addAllSpots = function (sx, sy) {
+    addAllSpotsCalls++;
+    for (const tid of this._testTiles || [0, 0, 1536, 2144]) {
+      if (tid >= 2048) this._addAutotile(null, tid, 0, 0);
+      this._addSpotTile(tid, 0, 0);
+    }
+    void sx; void sy;
+  };
+  MockMzTilemap.prototype.updateTransform = function () {
+    const ox = Math.ceil(this.origin.x);
+    const oy = Math.ceil(this.origin.y);
+    const sx = Math.floor((ox - this._margin) / this._tileWidth);
+    const sy = Math.floor((oy - this._margin) / this._tileHeight);
+    if (this._needsRepaint || this._lastAnimationFrame !== this.animationFrame || this._lastStartX !== sx || this._lastStartY !== sy) {
+      this._lastAnimationFrame = this.animationFrame;
+      this._lastStartX = sx;
+      this._lastStartY = sy;
+      this._addAllSpots(sx, sy);
+      this._needsRepaint = false;
+    }
+    this._sortChildren();
+  };
+  MockMzTilemap.prototype._sortChildren = function () {
+    this.children.sort(this._compareChildOrder.bind(this));
+  };
+  MockMzTilemap.prototype._compareChildOrder = function (a, b) {
+    if (a.z !== b.z) return a.z - b.z;
+    if (a.y !== b.y) return a.y - b.y;
+    return a.spriteId - b.spriteId;
+  };
+
+  function MockWindowLayer() {
+    this.visible = true;
+    this.children = [];
+    this.transform = {};
+  }
+  MockWindowLayer.prototype.render = function () { gfxCreated += 999; };
+
+  const mzRt = {
+    Utils: {},
+    Graphics: { width: 960, height: 540 },
+    SceneManager: {},
+    WebAudio: { prototype: {} },
+    StorageManager: {},
+    Bitmap: { prototype: {} },
+    PIXI: {
+      settings: {},
+      utils: { createIndicesForQuads: (n) => new Uint16Array(n * 6) },
+      Graphics: function () {
+        gfxCreated++;
+        this.clear = () => {};
+        this.render = () => {};
+      },
+    },
+    Tilemap: MockMzTilemap,
+    WindowLayer: MockWindowLayer,
+  };
+  mod.installMzCompat(
+    mzRt,
+    { getDisplayMode: () => 'fit', setDisplayMode() {}, getViewport: () => ({ x: 0, y: 0, w: 960, h: 540, gw: 960, gh: 540 }), getWebGLContext: () => null },
+    { isMinusJustPressed: () => false, setOverlayOpen() {}, pollGamepadRaw: () => null },
+    { title: 'Haven', gameDir: '/g', wwwRoot: '/g', saveDir: '/g/save', engine: 'mz', config: {} },
+  );
+
+  // 1) Flat Layer: zero _elements array allocations, exact 2*36=72 float upload, empty layer skips draw
+  const mzLayer = new MockMzLayer();
+  const mockMzRenderer = {
+    gl: { TRIANGLES: 4, STENCIL_TEST: 1, STENCIL_BUFFER_BIT: 2, EQUAL: 3, KEEP: 4, ALWAYS: 5, REPLACE: 6, ZERO: 0, ONE: 1, ONE_MINUS_SRC_ALPHA: 7, enable() {}, disable() {}, stencilFunc() {}, stencilOp() {}, blendFunc() {}, clear() { stencilClears++; }, clearStencil() {} },
+    plugins: { rpgtilemap: { getShader: () => ({ uniforms: { uProjectionMatrix: { append() {} } } }), bindTextures() {}, updateTextures() {} } },
+    batch: { setObjectRenderer() {}, flush() {} },
+    projection: { projectionMatrix: { copyTo() {} } },
+    shader: { bind() {} },
+    geometry: { bind() {}, updateBuffers() {}, draw() { glDraws++; } },
+    state: { set() {} },
+    framebuffer: { forceStencil() {} },
+  };
+  mzLayer.clear();
+  mzLayer.render(mockMzRenderer);
+  assert.equal(glDraws, 0, 'Empty Tilemap.Layer must skip shader/VAO/draw calls');
+  mzLayer.addRect(0, 48, 96, 0, 0, 24, 24);
+  mzLayer.addRect(4, 0, 0, 24, 0, 24, 24);
+  assert.equal(mzLayer._elements.length, 0, 'Must store rects in flat Float32Array without allocating JS arrays');
+  assert.equal(mzLayer.size(), 2);
+  mzLayer.render(mockMzRenderer);
+  assert.equal(glDraws, 1);
+  assert.equal(uploadedVertexLen, 72, 'Must upload exact active subarray (2 * 36 = 72 floats) instead of 2x over-allocated tail');
+
+  // 2) Tilemap 30-frame skip on static maps vs rebuild on animated water maps + zero-tile guard
+  const tm = new MockMzTilemap();
+  tm.children = [{ z: 3, y: 100, spriteId: 2 }, { z: 1, y: 200, spriteId: 1 }];
+  tm.updateTransform(); // initial build (animationFrame=0, only static A5=1536 + static A1=2144 + two 0s)
+  assert.equal(addAllSpotsCalls, 1);
+  assert.equal(spotTileInnerCalls, 2, 'tileId <= 0 slots must short-circuit before plugin _addSpotTile wrappers');
+  assert.deepEqual(tm.children.map((c) => c.spriteId), [1, 2], 'MZ Tilemap._sortChildren must sort z/y/spriteId');
+
+  tm.animationFrame = 1; // 30 frames later, camera stationary, no animated water -> SKIP rebuild!
+  tm.updateTransform();
+  assert.equal(addAllSpotsCalls, 1, 'Stationary map with no animated A1 water tiles must skip 30-frame _addAllSpots');
+
+  // Now put an animated water tile (2048) on map and refresh: 30-frame tick MUST rebuild!
+  tm._testTiles = [2048];
+  tm.refresh();
+  tm.updateTransform();
+  assert.equal(addAllSpotsCalls, 2);
+  tm.animationFrame = 2;
+  tm.updateTransform();
+  assert.equal(addAllSpotsCalls, 3, 'Map with visible animated A1 water tile must still animate every 30 frames');
+
+  // 3) WindowLayer: 0 open windows & 1 open window allocate ZERO PIXI.Graphics and ZERO stencil clears;
+  //    2+ open windows reuse a single pooled PIXI.Graphics across frames!
+  const wl = new MockWindowLayer();
+  let winRenders = 0;
+  const closedWin = { _isWindow: true, visible: true, openness: 0, render() { winRenders++; }, drawShape() {} };
+  const openWin1 = { _isWindow: true, visible: true, openness: 255, render() { winRenders++; }, drawShape() {} };
+  const openWin2 = { _isWindow: true, visible: true, openness: 255, render() { winRenders++; }, drawShape() {} };
+  wl.children = [closedWin];
+  wl.render(mockMzRenderer);
+  assert.equal(gfxCreated, 0);
+  assert.equal(stencilClears, 0);
+  assert.equal(winRenders, 0);
+
+  wl.children = [closedWin, openWin1];
+  wl.render(mockMzRenderer);
+  assert.equal(gfxCreated, 0, 'Single open window must render directly without stencil Graphics allocation');
+  assert.equal(stencilClears, 0);
+  assert.equal(winRenders, 1);
+
+  wl.children = [openWin1, openWin2];
+  wl.render(mockMzRenderer);
+  wl.render(mockMzRenderer);
+  assert.equal(gfxCreated, 1, 'Overlapping windows must reuse a single pooled PIXI.Graphics across frames');
+  assert.equal(stencilClears, 2);
+  assert.equal(winRenders, 5);
+
+  console.log('[PASS] VisuStella MZ hoisted _0x folder, DomNode.style.font, & MZ Tilemap/WindowLayer/Sprite fast-paths');
+}
+
+// ============================================================================
+// 19. MZ Battle, Filter, Texture-Coalescing & OpenTypePixelFont Fast-Paths
+// ============================================================================
+{
+  let btUpdates = 0;
+  let drawTextInner = 0;
+  let newFnCompiles = 0;
+  let multiTargetRefreshes = 0;
+  let gridBitmapClears = 0;
+  let dynCreateContents = 0;
+  let posClears = 0;
+  let rawPathTextCalls = 0;
+  let hueRtCreates = 0;
+
+  function MockRenderer() {}
+  MockRenderer.prototype.render = function () {};
+
+  function MockBaseTexture(w = 64, h = 64) {
+    this.width = w;
+    this.height = h;
+    this.resource = { source: { width: w, height: h } };
+  }
+  MockBaseTexture.prototype.update = function () {
+    btUpdates++;
+  };
+
+  function MockBitmap(w = 64, h = 64, url = '') {
+    this.width = w;
+    this.height = h;
+    this._url = url;
+    this.baseTexture = new MockBaseTexture(w, h);
+  }
+  MockBitmap.prototype.isReady = function () { return true; };
+  MockBitmap.prototype.clear = function () { gridBitmapClears++; };
+  MockBitmap.prototype.drawText = function () { drawTextInner++; };
+  MockBitmap.prototype.destroy = function () {};
+
+  function MockColorFilter() {
+    this.initialize();
+  }
+  MockColorFilter.prototype.initialize = function () {
+    this.enabled = true;
+    this.uniforms = {
+      hue: 0,
+      colorTone: [0, 0, 0, 0],
+      blendColor: [0, 0, 0, 0],
+      brightness: 255,
+    };
+  };
+  MockColorFilter.prototype.setHue = function (h) { this.uniforms.hue = Number(h); };
+  MockColorFilter.prototype.setBrightness = function (b) { this.uniforms.brightness = Number(b); };
+  MockColorFilter.prototype.setColorTone = function (t) { this.uniforms.colorTone = t.slice(); };
+  MockColorFilter.prototype.setBlendColor = function (c) { this.uniforms.blendColor = c.slice(); };
+
+  function MockSprite(bmp = null) {
+    this.children = [];
+    this.visible = true;
+    this._bitmap = bmp;
+    this._hue = 0;
+    this._colorTone = [0, 0, 0, 0];
+    this._blendColor = [0, 0, 0, 0];
+    this._colorFilter = null;
+    this.texture = { baseTexture: bmp ? bmp.baseTexture : null };
+  }
+  MockSprite.prototype.update = function () {
+    for (const child of this.children) {
+      if (child.update) {
+        child.update();
+      }
+    }
+  };
+  MockSprite.prototype._updateColorFilter = function () {
+    if (!this._colorFilter) this._colorFilter = new MockColorFilter();
+    this._colorFilter.setHue(this._hue);
+    this._colorFilter.setBlendColor(this._blendColor);
+    this._colorFilter.setColorTone(this._colorTone);
+  };
+  MockSprite.prototype.setHue = function (h) {
+    this._hue = Number(h);
+    this._updateColorFilter();
+  };
+  MockSprite.prototype.setColorTone = function (tone) {
+    this._colorTone = tone.slice();
+    this._updateColorFilter();
+  };
+  MockSprite.prototype.setBlendColor = function (color) {
+    this._blendColor = color.slice();
+    this._updateColorFilter();
+  };
+  MockSprite.prototype._refresh = function () {
+    if (this._bitmap && this.texture) this.texture.baseTexture = this._bitmap.baseTexture;
+  };
+  MockSprite.prototype._onBitmapLoad = function () {
+    this._refresh();
+  };
+
+  function MockWindow() {
+    this._isWindow = true;
+    this.visible = true;
+    this.active = false;
+    this._openness = 255;
+    this.openness = 255;
+    this.x = 0;
+    this.y = 0;
+    this._width = 200;
+    this._height = 100;
+    this._padding = 12;
+    this.origin = { x: 0, y: 0 };
+    this._clientArea = {
+      filters: [{ alpha: 1, enabled: true }],
+      filterArea: { x: 0, y: 0, width: 0, height: 0 },
+      worldTransform: { tx: 12, ty: 12, apply: () => ({ x: 12, y: 12 }) },
+    };
+    this._contentsSprite = { _bitmap: { width: 176, height: 76 } };
+    this.children = [];
+  }
+  Object.defineProperty(MockWindow.prototype, 'innerWidth', { get() { return this._width - this._padding * 2; } });
+  Object.defineProperty(MockWindow.prototype, 'innerHeight', { get() { return this._height - this._padding * 2; } });
+  MockWindow.prototype.update = function () {
+    if (this.active) {
+      this._animationCount++;
+    }
+    for (const child of this.children) {
+      if (child.update) {
+        child.update();
+      }
+    }
+  };
+  MockWindow.prototype._updateFilterArea = function () {
+    const pos = this._clientArea.worldTransform.apply(new Point(0, 0));
+    const filterArea = this._clientArea.filterArea;
+    filterArea.x = pos.x + this.origin.x;
+    filterArea.y = pos.y + this.origin.y;
+    filterArea.width = this.innerWidth;
+    filterArea.height = this.innerHeight;
+  };
+  MockWindow.prototype.updateTransform = function () {
+    this._updateFilterArea();
+  };
+  MockWindow.prototype.render = function () {};
+
+  function MockWindowLayer2() {
+    this.visible = true;
+    this.children = [];
+    this.transform = {};
+  }
+  MockWindowLayer2.prototype.isMaskingEnabled = () => true;
+  MockWindowLayer2.prototype.render = function () {};
+
+  function MockSpriteGauge() {
+    this._statusType = 'tp';
+    this._gaugeImgData = { VisibilityCondition: '$gameSystem._showTp' };
+    this.visible = false;
+  }
+  MockSpriteGauge.isGaugeVisible = () => true;
+  MockSpriteGauge.prototype.updateVisibility = function () {
+    const condition = this._gaugeImgData.VisibilityCondition;
+    const evalFunc = new Function('$gameSystem', `return ${condition};`);
+    this.visible = evalFunc(battleRt.$gameSystem);
+  };
+
+  function MockBattleMultiTarget() {
+    this.visible = false;
+    this._buttonKey = undefined;
+    this._buttonText = undefined;
+  }
+  MockBattleMultiTarget.SHOW_BUTTON = false;
+  MockBattleMultiTarget.prototype.refresh = function () { multiTargetRefreshes++; };
+  MockBattleMultiTarget.prototype.updateKeyboardKeys = function () {
+    if (this._buttonText !== '') this.refresh();
+  };
+
+  function MockGridPassives() {
+    this.bitmap = new MockBitmap(32, 32);
+    this._pictureSprite = { bitmap: null, visible: false };
+    this._currentPictureName = '';
+    this._iconIndex = 0;
+  }
+  MockGridPassives.prototype.stateIDs = function () { return [5]; };
+  MockGridPassives.prototype.setupAnimatedPicture = function () {};
+  MockGridPassives.prototype.onPictureLoad = function () {};
+  MockGridPassives.prototype.drawIconBitmap = function () {};
+  MockGridPassives.prototype.updatePictureSprite = function () {
+    const stateIds = this.stateIDs();
+    if (battleRt.$neo.StateNotetags[stateIds[0]]) {
+      this._pictureSprite.visible = true;
+      this.bitmap.clear();
+    }
+  };
+
+  function MockDynamicBattleText() {
+    this.x = 0;
+    this.y = 42;
+    this.height = 60;
+    this.contents = { clear() {} };
+    this._evalResult = ['Alert A'];
+  }
+  MockDynamicBattleText.prototype.fittingHeight = (n) => n * 36 + 24;
+  MockDynamicBattleText.prototype.evaluateConditions = function () { return this._evalResult; };
+  MockDynamicBattleText.prototype.createContents = function () { dynCreateContents++; this.contents = { clear() {} }; };
+  MockDynamicBattleText.prototype.drawAllText = function () {};
+  MockDynamicBattleText.prototype.refresh = function () {
+    this.contents.clear();
+    this._displayTexts = this.evaluateConditions();
+    this.createContents();
+    this.drawAllText();
+  };
+
+  function MockPositionedBattleText() {
+    this.contents = { clear() { posClears++; } };
+    this._entries = [];
+  }
+  MockPositionedBattleText.prototype.evaluateConditions = function () { return this._entries; };
+  MockPositionedBattleText.prototype.drawAllPositionedText = function () {};
+  MockPositionedBattleText.prototype.refresh = function () {
+    this.contents.clear();
+    this._activeEntries = this.evaluateConditions();
+    this.drawAllPositionedText();
+  };
+
+  function MockSceneBattle() {}
+  MockSceneBattle.prototype.createAllWindows = function () {
+    this._dynamicBattleTextWindow = new MockDynamicBattleText();
+    this._positionedBattleTextWindow = new MockPositionedBattleText();
+  };
+
+  function MockCtx2D() {
+    this.lineWidth = 4;
+    this.moves = [];
+    this.lines = [];
+  }
+  MockCtx2D.prototype.beginPath = function () {};
+  MockCtx2D.prototype.closePath = function () {};
+  MockCtx2D.prototype.moveTo = function (x, y) { this.moves.push([x, y]); };
+  MockCtx2D.prototype.lineTo = function (x, y) { this.lines.push([x, y]); };
+  MockCtx2D.prototype.fill = function () {};
+  MockCtx2D.prototype.stroke = function () {};
+  MockCtx2D.prototype._groupTextForDrawing = function (t, f) {
+    return [{ text: t, font: { shouldSquishText: false }, width: t.length * 8, scale: 1 }];
+  };
+  MockCtx2D.prototype._pathText = function (g, f, x, y) {
+    rawPathTextCalls++;
+    return {
+      commands: [
+        { type: 'M', x: 2 + x, y: 4 + y },
+        { type: 'L', x: 10 + x, y: 4 + y },
+        { type: 'Z' },
+        { type: 'M', x: -12345, y: -12345 },
+        { type: 'L', x: -12345, y: -12345 },
+      ],
+    };
+  };
+  MockCtx2D.prototype._fillText = function (g, f, x, y, w) {
+    const p = this._pathText(g, f, x, y, w);
+    for (const c of p.commands) {
+      if (c.type === 'M') this.moveTo(c.x, c.y);
+      else if (c.type === 'L') this.lineTo(c.x, c.y);
+    }
+  };
+  MockCtx2D.prototype._strokeText = function (g, f, x, y, w) {
+    this._fillText(g, f, x, y, w);
+  };
+
+  const rendererInst = new MockRenderer();
+  let wlStencilClears = 0;
+  const mockWlRenderer = {
+    gl: { STENCIL_TEST: 1, STENCIL_BUFFER_BIT: 2, EQUAL: 3, KEEP: 4, ALWAYS: 5, REPLACE: 6, ZERO: 0, ONE: 1, ONE_MINUS_SRC_ALPHA: 7, enable() {}, disable() {}, stencilFunc() {}, stencilOp() {}, blendFunc() {}, clear() { wlStencilClears++; }, clearStencil() {} },
+    batch: { flush() {} },
+    framebuffer: { forceStencil() {} },
+  };
+
+  const battleRt = {
+    Utils: {},
+    Graphics: { width: 960, height: 540, frameCount: 10, _app: { renderer: rendererInst } },
+    SceneManager: { _scene: { _windowLayer: null } },
+    WebAudio: { prototype: {} },
+    StorageManager: {},
+    $gameSystem: { _showTp: true },
+    $gameScreen: { picture: () => null },
+    $neo: { StateNotetags: { 5: 'GridPic' } },
+    ImageManager: { loadPicture: () => ({ addLoadListener(cb) { cb(); } }) },
+    Function: function (...args) {
+      newFnCompiles++;
+      return new globalThis.Function(...args);
+    },
+    Bitmap: MockBitmap,
+    ColorFilter: MockColorFilter,
+    Sprite: MockSprite,
+    Window: MockWindow,
+    WindowLayer: MockWindowLayer2,
+    Sprite_Gauge: MockSpriteGauge,
+    Window_BattleMultiTarget: MockBattleMultiTarget,
+    Sprite_BattleGridPassives: MockGridPassives,
+    Scene_Battle: MockSceneBattle,
+    CanvasRenderingContext2D: MockCtx2D,
+    PIXI: {
+      settings: {},
+      Renderer: MockRenderer,
+      BaseTexture: MockBaseTexture,
+      Sprite: function (tex) { this.texture = tex; this.filters = null; },
+      Texture: Object.assign(function (bt) { this.baseTexture = bt; }, { EMPTY: {} }),
+      RenderTexture: {
+        create: ({ width, height }) => {
+          hueRtCreates++;
+          return { baseTexture: new MockBaseTexture(width, height), destroy() {} };
+        },
+      },
+      Graphics: function () { this.clear = () => {}; this.render = () => {}; },
+    },
+  };
+
+  mod.installMzCompat(
+    battleRt,
+    { getDisplayMode: () => 'fit', setDisplayMode() {}, getViewport: () => ({ x: 0, y: 0, w: 960, h: 540, gw: 960, gh: 540 }), getWebGLContext: () => null },
+    { isMinusJustPressed: () => false, setOverlayOpen() {}, pollGamepadRaw: () => null },
+    { title: 'Haven', gameDir: '/g', wwwRoot: '/g', saveDir: '/g/save', engine: 'mz', config: {} },
+  );
+
+  // 1) BaseTexture.update coalesces within same render epoch, resets on Renderer.render, & drawText("") skips
+  const bt = new MockBaseTexture(128, 32);
+  bt.update();
+  bt.update();
+  bt.update();
+  assert.equal(btUpdates, 1, 'Multiple BaseTexture.update() calls in the same frame must coalesce to 1');
+  rendererInst.render();
+  bt.update();
+  assert.equal(btUpdates, 2, 'BaseTexture.update() must fire again after Renderer.render() advances epoch');
+
+  const bmp = new MockBitmap(64, 32);
+  bmp.drawText('');
+  bmp.drawText(null);
+  assert.equal(drawTextInner, 0, 'Empty/null Bitmap.drawText must short-circuit');
+  bmp.drawText(0);
+  bmp.drawText('HP');
+  assert.equal(drawTextInner, 2, 'Numeric 0 and non-empty strings must still draw');
+
+  // 2) ColorFilter auto-disables at identity & static URL-backed battlerHue pre-bakes into shared RenderTexture!
+  const cf = new MockColorFilter();
+  assert.equal(cf.enabled, false, 'Identity ColorFilter must start with enabled=false');
+  cf.setColorTone([30, 0, 0, 0]);
+  assert.equal(cf.enabled, true, 'Non-zero colorTone must enable ColorFilter');
+  cf.setColorTone([0, 0, 0, 0]);
+  assert.equal(cf.enabled, false, 'Returning colorTone to [0,0,0,0] must disable ColorFilter again');
+
+  const enemyBmp = new MockBitmap(128, 128, 'img/enemies/Slime.png');
+  const enemySpr1 = new MockSprite(enemyBmp);
+  const enemySpr2 = new MockSprite(enemyBmp);
+  enemySpr1.setHue(169);
+  enemySpr2.setHue(169);
+  assert.equal(hueRtCreates, 1, 'Multiple enemies sharing (Bitmap, hue) must bake only 1 shared RenderTexture');
+  assert.equal(enemySpr1.texture.baseTexture, enemySpr2.texture.baseTexture);
+  assert.notEqual(enemySpr1.texture.baseTexture, enemyBmp.baseTexture);
+  assert.equal(enemySpr1._colorFilter.enabled, false, 'Pre-baked hue sprite must disable per-frame ColorFilter FBO pass');
+  enemySpr1.setBlendColor([255, 255, 255, 160]);
+  assert.equal(enemySpr1._colorFilter.enabled, true, 'Hit-flash blendColor on pre-baked hue sprite must still enable ColorFilter');
+
+  // 3) Window AlphaFilter disables when unscrolled & contents fit, enables when scrolled; non-overlapping & offscreen WindowLayer
+  const winA = new MockWindow();
+  winA.updateTransform();
+  assert.equal(winA._clientArea.filters[0].enabled, false, 'Unscrolled open window with fitting contents must bypass AlphaFilter FBO');
+  winA.origin.y = 36;
+  winA.updateTransform();
+  assert.equal(winA._clientArea.filters[0].enabled, true, 'Scrolled window must enable AlphaFilter clipping');
+
+  const wl2 = new MockWindowLayer2();
+  battleRt.SceneManager._scene._windowLayer = wl2;
+  let renderedWins = [];
+  const wLeft = { _isWindow: true, visible: true, openness: 255, x: 0, y: 376, _width: 532, _height: 156, render() { renderedWins.push('left'); }, drawShape() {} };
+  const wRight = { _isWindow: true, visible: true, openness: 255, x: 532, y: 376, _width: 420, _height: 156, render() { renderedWins.push('right'); }, drawShape() {} };
+  const wOffscreen = { _isWindow: true, visible: true, openness: 255, x: 1904, y: 0, _width: 952, _height: 384, render() { renderedWins.push('off'); }, drawShape() {} };
+  wl2.children = [wLeft, wRight, wOffscreen];
+  wl2.render(mockWlRenderer);
+  assert.deepEqual(renderedWins, ['left', 'right'], 'Off-screen Window_BattleLog at x=1904 must be culled');
+  assert.equal(wlStencilClears, 0, 'Non-overlapping open battle windows must skip stencil passes');
+
+  // 4) NUUN_GaugeImage VisibilityCondition compiles Function once, Window_BattleMultiTarget skips refresh, GridPassives skips clear
+  const g1 = new MockSpriteGauge();
+  const g2 = new MockSpriteGauge();
+  for (let i = 0; i < 10; i++) { g1.updateVisibility(); g2.updateVisibility(); }
+  assert.equal(newFnCompiles, 1, 'NUUN_GaugeImage VisibilityCondition must compile once across all gauges & frames');
+  assert.equal(g1.visible, true);
+
+  const bmt = new MockBattleMultiTarget();
+  bmt.updateKeyboardKeys();
+  bmt.updateKeyboardKeys();
+  assert.equal(multiTargetRefreshes, 0, 'Hidden/SHOW_BUTTON=false Window_BattleMultiTarget must not refresh every frame');
+
+  const gp = new MockGridPassives();
+  gp.updatePictureSprite();
+  gp.updatePictureSprite();
+  gp.updatePictureSprite();
+  assert.equal(gridBitmapClears, 1, 'Sprite_BattleGridPassives must clear its bitmap only once when state picture is unchanged');
+
+  // 5) NEO_BattleTextAlerts closure-private windows skip redundant createContents/clear
+  const sb = new MockSceneBattle();
+  sb.createAllWindows();
+  sb._dynamicBattleTextWindow.refresh();
+  sb._dynamicBattleTextWindow.refresh();
+  sb._dynamicBattleTextWindow.refresh();
+  assert.equal(dynCreateContents, 0, 'Unchanged Window_DynamicBattleText height/text must not recreate Bitmap contents');
+  sb._positionedBattleTextWindow.refresh();
+  sb._positionedBattleTextWindow.refresh();
+  assert.equal(posClears, 1, 'Window_PositionedBattleText must clear 960x540 bitmap only when active entries change');
+
+  // 6) OpenTypePixelFont glyph path cache strips -12345 dummy cmds & translates integer shifts without re-tessellating
+  const ctx = new MockCtx2D();
+  const glyphGroup = { text: 'Attack', font: { shouldSquishText: false }, scale: 1 };
+  const fontMeta = { size: 16, fontStyle: 'normal' };
+  ctx._fillText(glyphGroup, fontMeta, 10, 20, 100);
+  ctx._fillText(glyphGroup, fontMeta, 50, 80, 100);
+  ctx._strokeText(glyphGroup, fontMeta, 50, 80, 100);
+  assert.equal(rawPathTextCalls, 1, 'OpenTypePixelFont must cache snapped glyph paths across integer (x, y) shifts & passes');
+  assert.deepEqual(ctx.moves, [[12, 24], [52, 84], [52, 84]], 'Cached glyph path must translate coordinates & strip -12345 dummy cmds');
+
+  console.log('[PASS] MZ Battle, ColorFilter/Hue/AlphaFilter, Texture-Coalescing & OpenTypePixelFont fast-paths');
+}
+
+// ============================================================================
+// 20. MZ `globalThis.main` AoE Shim & VisuMZ / NEO_InputConfig Quick-Menu Resume
+// ============================================================================
+{
+  let fatalCalls = 0;
+  let tickCalls = 0;
+  const mzAoeRt = {
+    Utils: {},
+    Graphics: {
+      width: 960,
+      height: 540,
+      _canRender: () => true,
+      _app: { render() {}, renderer: { render() {} } },
+      _onTick() { tickCalls++; },
+      stopGameLoop() {},
+    },
+    SceneManager: {
+      stop() {},
+      catchException() {},
+    },
+    WebAudio: { prototype: {} },
+    StorageManager: {},
+    Bitmap: { prototype: {} },
+    PIXI: { settings: {} },
+  };
+  mod.installMzCompat(
+    mzAoeRt,
+    { getDisplayMode: () => 'fit', setDisplayMode() {}, getViewport: () => ({ x: 0, y: 0, w: 960, h: 540, gw: 960, gh: 540 }), getWebGLContext: () => null },
+    { isMinusJustPressed: () => false, setOverlayOpen() {}, pollGamepadRaw: () => null },
+    { title: 'Haven', gameDir: '/g', wwwRoot: '/g', saveDir: '/g/save', engine: 'mz', config: {} },
+    { onFatalError: () => { fatalCalls++; } },
+  );
+
+  // 1) VisuMZ_2_BattleGridSystem `if (member === main) continue;` must not throw ReferenceError
+  assert.ok('main' in mzAoeRt && mzAoeRt.main && typeof mzAoeRt.main === 'object', 'installMzCompat must define runtime.main');
+  const getAoeFn = new Function(
+    'runtime',
+    'with (runtime) { return function(targets, unit) { const out = []; for (const m of unit) { if (m === main) continue; if (targets.includes(m)) continue; out.push(m); } return out; }; }',
+  )(mzAoeRt);
+  const e1 = { id: 1 }, e2 = { id: 2 }, e3 = { id: 3 };
+  assert.deepEqual(getAoeFn([e1], [e1, e2, e3]), [e2, e3], 'AoE target scan referencing `main` must succeed cleanly');
+
+  // 2) Fatal exception latching: stops ticking & invokes onFatalError only once
+  mzAoeRt.Graphics._onTick(1);
+  assert.equal(tickCalls, 1);
+  mzAoeRt.SceneManager.catchException(new Error('Boom'));
+  mzAoeRt.SceneManager.catchException(new Error('Boom 2'));
+  mzAoeRt.Graphics._onTick(1);
+  assert.equal(fatalCalls, 1, 'SceneManager.catchException must latch and invoke onFatalError once');
+  assert.equal(tickCalls, 1, 'Graphics._onTick must halt after fatal exception so error splash stays visible');
+
+  // 3) VisuMZ_0_CoreEngine `_gamepadWait = 24` + NEO_InputConfig `gamepadMapper[8] = 'tab'` Quick-Menu resume test!
+  const makeBtns = (pressedSet = []) =>
+    Array.from({ length: 16 }, (_, i) => ({ pressed: pressedSet.includes(i), value: pressedSet.includes(i) ? 1 : 0 }));
+  let activePads = [
+    { index: 0, connected: true, buttons: makeBtns([]), axes: [0, 0] },
+    { index: 1, connected: true, buttons: makeBtns([]), axes: [0, 0] },
+  ];
+  const prevNav = globalThis.navigator;
+  Object.defineProperty(globalThis, 'navigator', {
+    value: { getGamepads: () => activePads },
+    configurable: true,
+    writable: true,
+  });
+
+  try {
+    const visuInput = {
+      keyRepeatWait: 24,
+      gamepadMapper: { ...mod.DEFAULT_MV_GAMEPAD_MAP },
+      keyMapper: {},
+      _currentState: {},
+      _previousState: {},
+      _gamepadStates: [],
+      _latestButton: null,
+      _pressedTime: 0,
+      _dir4: 0,
+      _dir8: 0,
+      _gamepadWait: 0,
+      clear() {
+        this._currentState = {};
+        this._previousState = {};
+        this._gamepadStates = [];
+        this._latestButton = null;
+        this._pressedTime = 0;
+        // Exact VisuMZ_0_CoreEngine behavior that previously deadlocked gamepad input!
+        this._gamepadWait = this.keyRepeatWait;
+      },
+      update() {
+        this._pollGamepads();
+        if (this._gamepadWait) this._gamepadWait--;
+        for (const name in this._currentState) {
+          if (this._currentState[name] && !this._previousState[name]) {
+            this._latestButton = name;
+            this._pressedTime = 0;
+          }
+          this._previousState[name] = this._currentState[name];
+        }
+      },
+      _pollGamepads() {
+        if (this._gamepadWait) return;
+        for (const gp of globalThis.navigator.getGamepads()) {
+          if (gp && gp.connected) this._updateGamepadState(gp);
+        }
+      },
+      _updateGamepadState(gamepad) {
+        const lastState = this._gamepadStates[gamepad.index] || [];
+        const newState = [];
+        for (let i = 0; i < gamepad.buttons.length; i++) {
+          newState[i] = gamepad.buttons[i].pressed;
+        }
+        for (let j = 0; j < newState.length; j++) {
+          if (newState[j] !== lastState[j]) {
+            const buttonName = this.gamepadMapper[j];
+            if (buttonName) this._currentState[buttonName] = newState[j];
+          }
+        }
+        this._gamepadStates[gamepad.index] = newState;
+      },
+      isTriggered(name) {
+        return this._latestButton === name && this._pressedTime === 0;
+      },
+    };
+
+    const bridge = mod.createInputBridge();
+    bridge.installIntoRuntime(
+      { Input: visuInput, TouchInput: { clear() {} } },
+      () => ({ x: 0, y: 0, w: 960, h: 540, gw: 960, gh: 540 }),
+    );
+
+    // Simulate NEO_InputConfig overwriting Input.gamepadMapper on Scene_Boot.start (`6: '', 7: '', 8: 'tab'`)
+    visuInput.gamepadMapper = {
+      0: 'escape', 1: 'ok', 2: 'shift', 3: 'menu', 4: 'pagedown', 5: 'pageup',
+      6: '', 7: '', 8: 'tab', 9: 'menu', 12: 'up', 13: 'down', 14: 'left', 15: 'right',
+    };
+
+    // Multi-controller check: pad[0] idle, pad[1] pressing Minus (8) -> pollGamepadRaw must detect pad[1]!
+    activePads[1].buttons = makeBtns([8]);
+    assert.equal(bridge.pollGamepadRaw().index, 1, 'pollGamepadRaw must pick active controller when multiple pads are connected');
+    assert.equal(bridge.isMinusJustPressed(), true);
+
+    // Even if _updateGamepadState runs with Minus pressed, 'tab' must NOT fire on button 8 and must move to ZL (6)
+    visuInput.update();
+    assert.equal(visuInput._currentState.tab || false, false, 'Minus (button 8) must never trigger in-game tab');
+    assert.equal(visuInput.gamepadMapper[6], 'tab', 'NEO_InputConfig 8:tab must migrate to Switch ZL (button 6)');
+    assert.equal(visuInput.gamepadMapper[8], undefined, 'Button 8 must stay reserved for Quick Menu');
+
+    // Open Quick Menu, then close it with B (button 0) held for 2 frames, then release and press A (button 1 = ok)!
+    bridge.setOverlayOpen(true);
+    activePads[1].buttons = makeBtns([0]); // holding B to close menu
+    visuInput.update();
+    assert.equal(visuInput._gamepadWait, 0, 'VisuMZ _gamepadWait must stay 0 while overlay is open');
+
+    bridge.setOverlayOpen(false);
+    // B still held for 2 frames -> must not leak 'escape' into game
+    visuInput.update();
+    visuInput.update();
+    assert.equal(visuInput._currentState.escape || false, false, 'Held B from closing menu must not leak into game');
+
+    // Release B, let 2 settle frames run
+    activePads[1].buttons = makeBtns([]);
+    visuInput.update();
+    visuInput.update();
+    visuInput.update();
+    assert.equal(visuInput._gamepadWait, 0, 'VisuMZ _gamepadWait must remain 0 after overlay close');
+
+    // Immediately press A (button 1 = 'ok') -> MUST register on the very first frame without 300-frame lockup!
+    activePads[1].buttons = makeBtns([1]);
+    visuInput.update();
+    assert.equal(visuInput._currentState.ok, true, 'Buttons must respond immediately after closing Quick Menu');
+    assert.equal(visuInput.isTriggered('ok'), true);
+  } finally {
+    Object.defineProperty(globalThis, 'navigator', { value: prevNav, configurable: true, writable: true });
+  }
+
+  console.log('[PASS] MZ globalThis.main AoE shim, fatal exception latch & VisuMZ/NEO Quick-Menu input resume');
+}
+
+// 21. Verify per-engine log separation (mv.log vs mz.log), rich diagnostic reports & version sync
+{
+  const pkgJson = JSON.parse(readFileSync(join(loaderDir, 'package.json'), 'utf8'));
+  const launcherMk = readFileSync(join(loaderDir, '..', 'launcher', 'Makefile'), 'utf8');
+  const wolfMk = readFileSync(join(loaderDir, '..', 'wolf-engine', 'Makefile'), 'utf8');
+  const mkxpzPreload = readFileSync(join(loaderDir, '..', 'scripts', 'mkxpz', 'preload-compat-v2.rb'), 'utf8');
+
+  assert.equal(mod.SW2RPGMGL_VERSION, '0.3.2', 'SW2RPGMGL_VERSION must be bumped to 0.3.2');
+  assert.equal(pkgJson.version, mod.SW2RPGMGL_VERSION, 'package.json version must match SW2RPGMGL_VERSION');
+  assert.equal(pkgJson.nacp.version, mod.SW2RPGMGL_VERSION, 'package.json nacp.version must match SW2RPGMGL_VERSION');
+  assert.match(launcherMk, new RegExp(`^APP_VERSION\\s*:=\\s*${mod.SW2RPGMGL_VERSION}\\b`, 'm'));
+  assert.match(wolfMk, new RegExp(`^APP_VERSION\\s*:=\\s*${mod.SW2RPGMGL_VERSION}\\b`, 'm'));
+  assert.match(mkxpzPreload, new RegExp(`VERSION\\s*=\\s*"${mod.SW2RPGMGL_VERSION}"`));
+  assert.match(mkxpzPreload, /SW2RPGMGL v#\{VERSION\} — MKXP-Z Engine \(mkxpz\.log\)/);
+
+  const prevSwitch = globalThis.Switch;
+  try {
+    const logSw = createMockSwitch({
+      // 1) Standard encrypted MV game
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/index.html': '<title>Sample MV</title>',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/package.json': JSON.stringify({
+        name: 'sample-mv',
+        version: '1.2.0',
+        window: { width: 1280, height: 720 },
+      }),
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/data/System.json': JSON.stringify({
+        gameTitle: 'Sample MV Chronicle',
+        locale: 'ja_JP',
+        versionId: 987654,
+        hasEncryptedImages: true,
+        hasEncryptedAudio: true,
+        encryptionKey: '0123456789abcdef0123456789abcdef',
+      }),
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/img/system/Window.rpgmvp': 'enc',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/audio/bgm/Theme1.rpgmvo': 'enc',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/_jp_map.txt': 'img/pictures/立ち絵.rpgmvp\timg/pictures/_jp_001.rpgmvp\n',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/www/js/plugins.js':
+        'var $plugins = [\n' +
+        '{"name":"YEP_CoreEngine","status":true,"description":"","parameters":{}},\n' +
+        '{"name":"MOG_TitleParticles","status":true,"description":"","parameters":{}},\n' +
+        '{"name":"UnusedPlugin","status":false,"description":"","parameters":{}}\n' +
+        '];',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/save/file1.rpgsave': 's1',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV/save/global.rpgsave': 'g1',
+
+      // 2) Custom OMORI-encrypted game
+      'sdmc:/switch/SW2RPGMGL/games/SampleOmori/Riruka24.ini': 'Args=--secretlaunchkey\n',
+      'sdmc:/switch/SW2RPGMGL/games/SampleOmori/www/index.html': '<title>OMORI</title>',
+      'sdmc:/switch/SW2RPGMGL/games/SampleOmori/www/data/System.KEL': 'enc',
+      'sdmc:/switch/SW2RPGMGL/games/SampleOmori/www/js/plugins/OmoriBase.OMORI': 'enc',
+      'sdmc:/switch/SW2RPGMGL/games/SampleOmori/www/js/plugins.js':
+        'var $plugins = [{"name":"OmoriBase","status":true,"parameters":{}}];',
+
+      // 3) Encrypted MZ game with KageDesu PKD Protector & custom overrides
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/index.html': '<title>Sample MZ</title>',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/js/rmmz_core.js': '// mz',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/mv-loader.json': JSON.stringify({ displayMode: 'stretch' }),
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/data/System.json': JSON.stringify({
+        gameTitle: 'Sample MZ Quest',
+        locale: 'en_US',
+        hasEncryptedImages: true,
+        hasEncryptedAudio: false,
+        encryptionKey: 'fedcba9876543210fedcba9876543210',
+        advanced: { screenWidth: 1280, screenHeight: 720, uiAreaWidth: 1152, uiAreaHeight: 648 },
+      }),
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/img/system/Window.png_': 'enc',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/audio/bgm/Field1.ogg': 'raw',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/js/plugins/Assets.pkd': 'pkd',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ/js/plugins.js':
+        'var $plugins = [{"name":"VisuMZ_0_CoreEngine","status":true,"parameters":{}},{"name":"PKD_Protector","status":true,"parameters":{}}];',
+    });
+
+    // Verify MV writes exclusively to log/mv.log
+    logSw.argv = [
+      'sdmc:/switch/SW2RPGMGL/engines/mv-engine-switch2.nro',
+      'sdmc:/switch/SW2RPGMGL/engines/mv-engine-switch2.nro',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMV',
+      'sdmc:/switch/SW2RPGMGL/SW2RPGMGL.nro',
+    ];
+    globalThis.Switch = logSw;
+    mod.initLog('mv.log', 'RPG Maker MV Engine');
+    assert.equal(mod.getLogPath(), 'sdmc:/switch/SW2RPGMGL/log/mv.log');
+
+    const mvGame = mod.inspectSingleMvGame(logSw, 'sdmc:/switch/SW2RPGMGL/games/SampleMV');
+    const mvAssets = mod.createAssetReader(mvGame.wwwRoot, logSw);
+    const mvDiag = mod.logGameDiagnostics(logSw, mvGame, mvAssets, {
+      rendererMode: 'Canvas2D (Skia GPU)',
+    });
+    assert.equal(mvDiag.title, 'Sample MV Chronicle');
+    assert.equal(mvDiag.jpMapCount, 1);
+    assert.deepEqual(mvDiag.enabledPlugins, ['YEP_CoreEngine', 'MOG_TitleParticles']);
+    assert.equal(mvDiag.totalPlugins, 3);
+    assert.match(mvDiag.encryptionSummary, /Standard MV \(\.rpgmvp\/\.rpgmvo\)/);
+    assert.match(mvDiag.encryptionSummary, /key=present \(32 chars\)/);
+    // Secret encryption key itself must NEVER appear in the shareable log!
+    const mvLogText = new TextDecoder().decode(logSw.readFileSync('sdmc:/switch/SW2RPGMGL/log/mv.log'));
+    assert.ok(!mvLogText.includes('0123456789abcdef0123456789abcdef'), 'Raw encryptionKey must never leak into mv.log');
+    assert.ok(mvLogText.includes('SW2RPGMGL v0.3.2 — RPG Maker MV Engine (mv.log)'));
+    assert.ok(mvLogText.includes('YEP_CoreEngine, MOG_TitleParticles'));
+
+    // Verify OMORI custom encryption detection
+    const omoriGame = mod.inspectSingleMvGame(logSw, 'sdmc:/switch/SW2RPGMGL/games/SampleOmori');
+    const omoriAssets = mod.createAssetReader(omoriGame.wwwRoot, logSw);
+    const omoriDiag = mod.collectGameDiagnostics(logSw, omoriGame, omoriAssets, {
+      rendererMode: 'Canvas2D (Skia GPU)',
+    });
+    assert.match(omoriDiag.encryptionSummary, /OMORI AES-256-CTR.*Riruka24\.ini=present/);
+
+    // Verify MZ writes exclusively to log/mz.log without touching log/mv.log!
+    logSw.argv = [
+      'sdmc:/switch/SW2RPGMGL/engines/mz-engine-switch2.nro',
+      'sdmc:/switch/SW2RPGMGL/engines/mz-engine-switch2.nro',
+      'sdmc:/switch/SW2RPGMGL/games/SampleMZ',
+      'sdmc:/switch/SW2RPGMGL/SW2RPGMGL.nro',
+    ];
+    mod.initLog('mz.log', 'RPG Maker MZ Engine (WebGL2)');
+    assert.equal(mod.getLogPath(), 'sdmc:/switch/SW2RPGMGL/log/mz.log');
+
+    const mzGame = mod.inspectSingleMzGame(logSw, 'sdmc:/switch/SW2RPGMGL/games/SampleMZ');
+    const mzAssets = mod.createAssetReader(mzGame.wwwRoot, logSw);
+    const mzDiag = mod.logGameDiagnostics(logSw, mzGame, mzAssets, {
+      rendererMode: 'Hardware WebGL2 (OunceVK ES3)',
+    });
+    assert.equal(mzDiag.configuredResolution, '1280x720 (UI 1152x648)');
+    assert.match(mzDiag.encryptionSummary, /KageDesu \/ PKD Protector/);
+    assert.match(mzDiag.encryptionSummary, /Standard MZ \(\.png_\/\.ogg_\)/);
+
+    const mzLogText = new TextDecoder().decode(logSw.readFileSync('sdmc:/switch/SW2RPGMGL/log/mz.log'));
+    const mvLogAfterMz = new TextDecoder().decode(logSw.readFileSync('sdmc:/switch/SW2RPGMGL/log/mv.log'));
+    assert.ok(mzLogText.includes('SW2RPGMGL v0.3.2 — RPG Maker MZ Engine (WebGL2) (mz.log)'));
+    assert.ok(mzLogText.includes('Sample MZ Quest'));
+    assert.ok(!mzLogText.includes('fedcba9876543210fedcba9876543210'), 'Raw encryptionKey must never leak into mz.log');
+    assert.ok(mvLogAfterMz.includes('Sample MV Chronicle'), 'Launching MZ must preserve mv.log intact');
+    assert.ok(!mvLogAfterMz.includes('Sample MZ Quest'), 'MZ logs must not bleed into mv.log');
+  } finally {
+    globalThis.Switch = prevSwitch;
+  }
+
+  console.log('[PASS] Per-engine logs (mv.log / mz.log / mkxpz.log), shareable encryption/plugin diagnostics & v0.3.2 sync');
+}
+
+// 22. Verify MZ .rmmzsave non-truncating UTF-8 save/load & OpenTypePixelFont OffscreenCanvas prototype sync
+{
+  const prevTextEncoder = globalThis.TextEncoder;
+  const prevC2D = globalThis.CanvasRenderingContext2D;
+  const prevOffC2D = globalThis.OffscreenCanvasRenderingContext2D;
+  const prevOffCanvas = globalThis.OffscreenCanvas;
+  const prevNativeDollar = globalThis.$;
+
+  try {
+    // 1) Simulate upstream nx.js's buggy 1.5x TextEncoder that truncates >50% high-byte deflate strings!
+    class BuggyNxTextEncoder {
+      encode(input = '') {
+        const len = input.length;
+        const tlen = Math.max(32, len + (len >>> 1) + 7);
+        const target = new Uint8Array((tlen >>> 3) << 3);
+        let at = 0;
+        for (let pos = 0; pos < len; pos++) {
+          const v = input.charCodeAt(pos);
+          if (v < 0x80) target[at++] = v;
+          else if (v < 0x800) {
+            target[at++] = ((v >>> 6) & 0x1f) | 0xc0;
+            target[at++] = (v & 0x3f) | 0x80;
+          } else {
+            target[at++] = ((v >>> 12) & 0x0f) | 0xe0;
+            target[at++] = ((v >>> 6) & 0x3f) | 0x80;
+            target[at++] = (v & 0x3f) | 0x80;
+          }
+        }
+        return target.slice(0, at);
+      }
+    }
+    const nxPrivateEncoder = new BuggyNxTextEncoder();
+    globalThis.TextEncoder = BuggyNxTextEncoder;
+
+    // Build a binary string with ~85% bytes >= 0x80 (guaranteed to overflow 1.5x buffer before fix!)
+    let highByteZip = '';
+    for (let i = 0; i < 4096; i++) {
+      highByteZip += String.fromCharCode((i % 7 === 0) ? (i & 0x7f) : (0x80 | (i & 0x7f)));
+    }
+    // Sanity-check that unpatched BuggyNxTextEncoder really did corrupt it:
+    assert.ok(nxPrivateEncoder.encode(highByteZip).byteLength < 7000, 'Unpatched 1.5x encoder truncates high-byte string');
+
+    // Installing browser-host / node-compat must patch BuggyNxTextEncoder.prototype.encode IN PLACE
+    // (fixing nxPrivateEncoder too!) and write/read full binary strings via fs.writeFileSync / readFileSync!
+    const saveSw = createMockSwitch({});
+    saveSw.writeFileSync = (p, val) => {
+      const bytes = typeof val === 'string' ? nxPrivateEncoder.encode(val) : new Uint8Array(val);
+      saveSw._files.set(p.replace(/\/+$/, ''), bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    };
+    const saveRt = { TextEncoder: BuggyNxTextEncoder };
+    mod.installNodeCompat(saveRt, saveSw, 'sdmc:/switch/SW2RPGMGL/games/Haven', 'sdmc:/switch/SW2RPGMGL/games/Haven/save');
+
+    // Even nxPrivateEncoder (already instantiated before installNodeCompat) is now fixed via prototype!
+    const fixedBytes = nxPrivateEncoder.encode(highByteZip);
+    assert.equal(mod.decodeUtf8Safe(fixedBytes), highByteZip, 'Patched TextEncoder.prototype.encode must preserve 100% of bytes');
+
+    const fsShim = saveRt.require('fs');
+    fsShim.writeFileSync('sdmc:/switch/SW2RPGMGL/games/Haven/save/file1.rmmzsave', highByteZip);
+    const loadedZip = fsShim.readFileSync('sdmc:/switch/SW2RPGMGL/games/Haven/save/file1.rmmzsave', { encoding: 'utf8' });
+    assert.equal(loadedZip.length, highByteZip.length, '.rmmzsave length must match 100% after round-trip');
+    assert.equal(loadedZip, highByteZip, '.rmmzsave content must round-trip bit-for-bit');
+
+    // 2) Simulate separate CanvasRenderingContext2D vs OffscreenCanvasRenderingContext2D + $.canvasContext2dMeasureTextWidth
+    //    (matching real Switch 2 nx.js) + OpenTypePixelFont.js!
+    const pathDraws = [];
+    class MockScreenCtx2D {
+      constructor() { this._nativeFont = ''; this.font = '10px sans-serif'; }
+      get font() { return this._nativeFont; }
+      set font(v) {
+        // Mirror nx.js: `if (!v || this.font === v) return;` + early return on unregistered families
+        if (!v || this.font === v) return;
+        if (/rmmz-tinyfont|Tiny Pixel/i.test(v)) return;
+        this._nativeFont = v;
+      }
+      save() {}
+      restore() {}
+      beginPath() {}
+      closePath() {}
+      moveTo() {}
+      lineTo() {}
+      fill() { pathDraws.push('screen-fill'); }
+      stroke() {}
+      measureText(t) { return { width: String(t).length * 20 }; }
+      fillText() { pathDraws.push('screen-native-fillText'); }
+      strokeText() {}
+    }
+    class MockOffscreenCtx2D {
+      constructor() { this._nativeFont = ''; this.font = '10px sans-serif'; }
+      get font() { return this._nativeFont; }
+      set font(v) {
+        // Mirror nx.js: `if (!v || this.font === v) return;` + early return on unregistered families
+        if (!v || this.font === v) return;
+        if (/rmmz-tinyfont|Tiny Pixel/i.test(v)) return;
+        this._nativeFont = v;
+      }
+      save() {}
+      restore() {}
+      beginPath() {}
+      closePath() {}
+      moveTo() {}
+      lineTo() {}
+      fill() { pathDraws.push(`offscreen-glyph-fill:${this.font}`); }
+      stroke() { pathDraws.push(`offscreen-glyph-stroke:${this.font}`); }
+      measureText(t) { return { width: String(t).length * 20 }; }
+      fillText() { pathDraws.push('BROKEN-native-fillText'); }
+      strokeText() { pathDraws.push('BROKEN-native-strokeText'); }
+    }
+    globalThis.CanvasRenderingContext2D = MockScreenCtx2D;
+    globalThis.OffscreenCanvasRenderingContext2D = MockOffscreenCtx2D;
+    globalThis.OffscreenCanvas = class {
+      constructor(w = 1, h = 1) { this.width = w; this.height = h; this._c = null; }
+      getContext(k) { return k === '2d' ? (this._c ||= new MockOffscreenCtx2D()) : null; }
+    };
+    // Simulate Switch 2 native HarfBuzz width hook (returns huge 20px/char width if OpenTypePixelFont is bypassed!)
+    globalThis.$ = { canvasContext2dMeasureTextWidth: (_ctx, str) => str.length * 20 };
+
+    // Simulate OpenTypePixelFont.js installing its hooks ONLY onto CanvasRenderingContext2D.prototype
+    const fakeOpenFont = {
+      familyName: 'rmmz-tinyfont',
+      shouldSquishText: false,
+      snap: true,
+    };
+    MockScreenCtx2D.prototype._groupTextForDrawing = function (t, f) {
+      const g = [{ text: String(t), font: fakeOpenFont, width: String(t).length * 5, scale: 1 }];
+      g.width = String(t).length * 5;
+      g.advanceWidth = g.width;
+      g.parsedSize = f.size;
+      return g;
+    };
+    MockScreenCtx2D.prototype._pathText = function (g, f, x, y) {
+      return {
+        commands: [
+          { type: 'M', x, y },
+          { type: 'L', x: x + f.size, y },
+          { type: 'Z' },
+        ],
+      };
+    };
+    MockScreenCtx2D.prototype._fillText = function (g, f, x, y, w) {
+      const p = this._pathText(g, f, x, y, w);
+      if (p.commands.length) { this.beginPath(); this.fill(); }
+    };
+    MockScreenCtx2D.prototype._strokeText = function (g, f, x, y, w) {
+      const p = this._pathText(g, f, x, y, w);
+      if (p.commands.length) { this.beginPath(); this.stroke(); }
+    };
+    MockScreenCtx2D.prototype.measureText = function (t, w) {
+      const m = /(\d+)px\s+(.+)/.exec(this.font);
+      const f = { fontSize: (m?.[1] || '16') + 'px', size: Number(m?.[1] || 16), fontFamily: (m?.[2] || '').toLowerCase(), fontStyle: 'normal', isOpenFont: true };
+      return this._groupTextForDrawing(t, f, w);
+    };
+    MockScreenCtx2D.prototype.fillText = function (t, x, y, w) {
+      const groups = this.measureText(t, w);
+      const m = /(\d+)px\s+(.+)/.exec(this.font);
+      const f = { fontSize: (m?.[1] || '16') + 'px', size: Number(m?.[1] || 16), fontFamily: (m?.[2] || '').toLowerCase(), fontStyle: 'normal', isOpenFont: true };
+      for (const g of groups) this._fillText(g, f, x, y, g.width);
+    };
+    MockScreenCtx2D.prototype.strokeText = function (t, x, y, w) {
+      const groups = this.measureText(t, w);
+      const m = /(\d+)px\s+(.+)/.exec(this.font);
+      const f = { fontSize: (m?.[1] || '16') + 'px', size: Number(m?.[1] || 16), fontFamily: (m?.[2] || '').toLowerCase(), fontStyle: 'normal', isOpenFont: true };
+      for (const g of groups) this._strokeText(g, f, x, y, g.width);
+    };
+
+    const dummyAssets = mod.createAssetReader('sdmc:/g', createMockSwitch({}));
+    const host = mod.createBrowserHost(dummyAssets, (_p, s) => s, { width: 1280, height: 720, getContext: () => null }, { enableWebGL: true });
+    // Even if a canvas was created BEFORE installMzCompat, wrapper must pick up OpenTypePixelFont once synced!
+    const preCanvas = globalThis.document.createElement('canvas');
+    const preCtx = preCanvas.getContext('2d');
+
+    mod.installMzCompat(
+      globalThis,
+      host,
+      mod.createInputBridge(),
+      { id: 'h', folderName: 'Haven', engine: 'mz', title: 'Haven', gameDir: '/g', wwwRoot: '/g', saveDir: '/g/save', iconPath: null, pluginCount: 1, saveCount: 0, locale: '', encrypted: false, config: {} },
+      {},
+    );
+
+    // Verify splash/native Skia fonts (e.g. MZ WebGL splash OffscreenCanvas & MV screen ctx) are NOT
+    // short-circuited by nx.js's `if (this.font === v) return;` check after installFontLeakGuard!
+    const splashCanvas = new globalThis.OffscreenCanvas(1280, 720);
+    const splashCtx = splashCanvas.getContext('2d');
+    assert.equal(splashCtx._nativeFont, '10px sans-serif', 'Newly constructed OffscreenCanvas must initialize native 10px sans-serif font');
+    splashCtx.font = '40px sans-serif';
+    assert.equal(splashCtx._nativeFont, '40px sans-serif', 'Native Skia font must update to 40px sans-serif for MZ/MV splash screen');
+    splashCtx.font = 'bold 24px sans-serif';
+    assert.equal(splashCtx._nativeFont, '24px sans-serif', 'Bold weight stripped for Skia leak guard while updating pixel size to 24px');
+    assert.equal(splashCtx.font, 'bold 24px sans-serif', 'Logical CSS font retains bold weight');
+
+    preCtx.font = '8px rmmz-tinyfont';
+    assert.equal(preCtx.font, '8px rmmz-tinyfont', 'Logical CSS font must be preserved even when Skia FontFaceSet lacks virtual family');
+    const measured = preCtx.measureText('Latest Save');
+    assert.equal(measured.width, 55, 'wrapper.measureText must use OpenTypePixelFont width (5px/ch) instead of native HarfBuzz (20px/ch)');
+    preCtx.lineWidth = 4;
+    preCtx.strokeText('Latest Save', 10, 20, 200);
+    preCtx.fillText('Latest Save', 10, 20, 200);
+    assert.ok(!pathDraws.includes('BROKEN-native-fillText'), 'OffscreenCanvas Bitmap must never fall back to oversized native fillText');
+    assert.ok(pathDraws.includes('offscreen-glyph-fill:8px rmmz-tinyfont'), 'OffscreenCanvas Bitmap must render crisp OpenTypePixelFont glyph paths');
+  } finally {
+    globalThis.TextEncoder = prevTextEncoder;
+    globalThis.CanvasRenderingContext2D = prevC2D;
+    globalThis.OffscreenCanvasRenderingContext2D = prevOffC2D;
+    globalThis.OffscreenCanvas = prevOffCanvas;
+    globalThis.$ = prevNativeDollar;
+  }
+
+  console.log('[PASS] Non-truncating MZ .rmmzsave TextEncoder & OpenTypePixelFont OffscreenCanvas prototype sync');
 }
 
 console.log('\nALL UNIVERSAL SW2RPGMGL TESTS PASSED!');

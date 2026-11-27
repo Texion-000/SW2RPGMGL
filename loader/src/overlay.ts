@@ -79,8 +79,9 @@ export function createOverlay(
     const sw = getSwitch();
     let memMiB = 0;
     try {
-      const m = sw?.memoryUsage?.();
-      if (m?.used) memMiB = Math.round(m.used / (1024 * 1024));
+      const m: any = sw?.memoryUsage?.();
+      const used = m?.usedHeapSize ?? m?.used;
+      if (used) memMiB = Math.round(used / (1024 * 1024));
     } catch { /* ignore */ }
     const runtime = globalThis as any;
     const st = runtime.__drPerfStats;
@@ -161,7 +162,14 @@ export function createOverlay(
     if (open === next) return;
     open = next;
     input.setOverlayOpen(open);
-    if (!open) host.markLetterboxDirty();
+    if (open) {
+      prevUp = true;
+      prevDown = true;
+      prevA = true;
+      prevB = true;
+    } else {
+      host.markLetterboxDirty();
+    }
   }
 
   function items() {
@@ -190,7 +198,6 @@ export function createOverlay(
           (globalThis as any).__drHudMode = hudMode;
           lastGlKey = '';
           host.markLetterboxDirty();
-          log(`[overlay] hudMode -> ${hudMode}`);
         },
       },
       {
@@ -199,6 +206,17 @@ export function createOverlay(
           host.forceStopVideos();
           setOpen(false);
           log('[overlay] skipped active video(s)');
+        },
+      },
+      {
+        label: 'Log On-Screen Objects (debug)',
+        run: () => {
+          const dump = (globalThis as any).__drDumpScene;
+          if (typeof dump === 'function') {
+            try { dump(); } catch (err) { log(`[overlay] scene dump failed: ${String(err)}`); }
+          } else {
+            log('[overlay] scene dump not available for this engine');
+          }
         },
       },
       {

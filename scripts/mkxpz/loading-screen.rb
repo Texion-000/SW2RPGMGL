@@ -24,7 +24,12 @@ module SW2Loading
 
 	@sprite = nil
 	@last = nil
+	@done = false
+	@latin_font_checked = false
+	@latin_font_name = nil
 	@update = Graphics.method(:update)
+	@freeze = Graphics.method(:freeze)
+	@transition = Graphics.method(:transition)
 	# Native methods, saved before game scripts can override them (Pokemon Essentials: Graphics.width)
 	@width = Graphics.method(:width)
 	@height = Graphics.method(:height)
@@ -33,6 +38,15 @@ module SW2Loading
 	FONT_SCALE = 1.25
 	LATIN_FONT = "Liberation Sans"
 	LATIN_TEXT = /\A[\u0000-ɏ -⁯]*\z/
+
+	def self.latin_font
+		unless @latin_font_checked
+			@latin_font_checked = true
+			has_lib = (defined?(Font) && Font.respond_to?(:exist?) && Font.exist?(LATIN_FONT)) rescue false
+			@latin_font_name = has_lib ? LATIN_FONT : Font.default_name
+		end
+		@latin_font_name || Font.default_name
+	end
 
 	def self.now
 		Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -71,7 +85,7 @@ module SW2Loading
 		text = lambda do |top, size, color, str|
 			str = str.to_s
 			fs = [px.call(size * FONT_SCALE), 9].max
-			b.font.name = str.match?(LATIN_TEXT) ? LATIN_FONT : Font.default_name
+			b.font.name = str.match?(LATIN_TEXT) ? latin_font : Font.default_name
 			b.font.size = fs
 			b.font.color = color
 			b.draw_text(margin, px.call(top) - (fs * 0.12).round, tw, (fs * 1.3).round, str)
@@ -93,6 +107,8 @@ module SW2Loading
 		text.call(288, 18, DETAIL, clip(detail, 90)) unless detail.to_s.empty?
 		text.call(720 - 54, 16, HINT, "Press Minus (-) anytime in-game for the Quick Menu")
 
+		was_frozen = Graphics.respond_to?(:sw2_frozen?) && Graphics.sw2_frozen?
+		@transition.call(0) if was_frozen
 		@resize.call(w, h) if ow != w || oh != h
 		begin
 			@sprite.visible = true
@@ -100,6 +116,7 @@ module SW2Loading
 		ensure
 			@sprite.visible = false
 			@resize.call(ow, oh) if ow != w || oh != h
+			@freeze.call if was_frozen
 		end
 		@last = now
 	rescue StandardError => e
@@ -108,18 +125,19 @@ module SW2Loading
 
 	# Called by the script loader before each game script is evaluated.
 	def self.step(index, count, name, rgss)
-		return if count <= 0
-		if index >= count - 1
+		return if @done || count <= 0
+		clean_name = name.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?")
+		if index >= count - 1 || clean_name.strip.casecmp("main") == 0
 			draw(1.0, "Starting #{clip(System.game_title, 40)}…", "", rgss)
 			finish
 			return
 		end
 		return if @last && now - @last < MIN_INTERVAL
-		draw(0.05 + 0.9 * index / count, "Loading game scripts (#{index + 1}/#{count})…",
-		     name.to_s.dup.force_encoding(Encoding::UTF_8).scrub("?"), rgss)
+		draw(0.05 + 0.9 * index / count, "Loading game scripts (#{index + 1}/#{count})…", clean_name, rgss)
 	end
 
 	def self.finish
+		@done = true
 		return unless @sprite
 		@sprite.bitmap.dispose if !@sprite.disposed? && @sprite.bitmap
 		@sprite.dispose unless @sprite.disposed?

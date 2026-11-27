@@ -6,6 +6,7 @@ import type { SwitchApi } from './log';
 
 export interface AssetReader {
   readonly wwwRoot: string;
+  readonly jpMapCount: number;
   resolvePath(relPath: string): string | null;
   read(relPath: string): Promise<ArrayBuffer | null>;
   readSync(relPath: string): ArrayBuffer | null;
@@ -168,6 +169,9 @@ export function createAssetReader(
 
   return {
     wwwRoot: cleanRoot,
+    get jpMapCount() {
+      return jpFileMap.size;
+    },
     resolvePath,
     readDirSync,
     async read(relPath: string): Promise<ArrayBuffer | null> {

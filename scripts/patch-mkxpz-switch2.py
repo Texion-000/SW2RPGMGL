@@ -341,6 +341,52 @@ static void normalizeRgssEntryName(char *nameBuf, uint32_t &nameLen, size_t bufC
     )
 
 
+def patch_fs_rtp_for_self_contained_games() -> None:
+    # The shared VX Ace RTP folder was only mounted when the game lacks Graphics/System/IconSet.png.
+    # Games that ship their own IconSet but still use RTP tilesets, sounds and the RTP font
+    # (VL Gothic -> Japanese text drawn as boxes otherwise, e.g. N.P.C. Dreams) never got it.
+    # Also mount it whenever Game.ini declares RTP=RPGVXAce. The RTP is mounted with lower priority
+    # and its scan never overrides files the game ships itself.
+    patch_file(
+        "src/filesystem/filesystem.cpp",
+        "// [switch2-fs-rtp-gameini]",
+        [
+            (
+                "struct CacheEnumData {",
+                "// [switch2-fs-rtp-gameini]\n"
+                "#ifdef __SWITCH__\n"
+                "static bool gameIniWantsVxAceRtp() {\n"
+                "  FILE *f = fopen(\"Game.ini\", \"rb\");\n"
+                "  if (!f)\n"
+                "    return false;\n"
+                "  char line[512];\n"
+                "  bool want = false;\n"
+                "  while (!want && fgets(line, sizeof(line), f)) {\n"
+                "    std::string s(line);\n"
+                "    strTolower(s);\n"
+                "    size_t k = s.find_first_not_of(\" \\t\\xef\\xbb\\xbf\");\n"
+                "    if (k == std::string::npos || s.compare(k, 3, \"rtp\") != 0)\n"
+                "      continue;\n"
+                "    size_t eq = s.find('=', k + 3);\n"
+                "    if (eq != std::string::npos && s.find(\"rpgvxace\", eq) != std::string::npos)\n"
+                "      want = true;\n"
+                "  }\n"
+                "  fclose(f);\n"
+                "  return want;\n"
+                "}\n"
+                "#endif\n\n"
+                "struct CacheEnumData {",
+            ),
+            (
+                "  if (!p->pathCache.contains(\"graphics/system/iconset.png\")) {\n"
+                "    // 1. Fast path: check dedicated RTP folders",
+                "  if (!p->pathCache.contains(\"graphics/system/iconset.png\") || gameIniWantsVxAceRtp()) {\n"
+                "    // 1. Fast path: check dedicated RTP folders",
+            ),
+        ],
+    )
+
+
 def patch_filesystem_mojibake() -> None:
     mojibake_helpers = """// [switch2-fs-mojibake]
 #include <iconv.h>
@@ -986,6 +1032,25 @@ def patch_switch_controls_raw_keys() -> None:
                 '    const SwitchControls::Profile &prof = activeProfile ? *activeProfile : SwitchControls::defaultProfile();\n'
                 '    SwitchControls::applyKeys(prof, buttons, axes, keyStates);\n'
                 '}',
+            ),
+        ],
+    )
+    # v3: include PageUp/PageDown on L/R shoulders for Win32 GetAsyncKeyState scripts (e.g. WASD MODULE)
+    # and keep Minus (-) dedicated to the SW2RPGMGL Quick Menu instead of pulsing In_X (Shift+D).
+    patch_file(
+        "switch/switch_controls.cpp",
+        "// [switch2-shoulder-pagekeys-and-minus-v3]",
+        [
+            (
+                "    p.keys[In_Minus] = p.keys[In_X];\n"
+                "    p.keys[In_Plus] = p.keys[In_Y];\n"
+                "    p.keys[In_L] = {SDL_SCANCODE_Q};\n"
+                "    p.keys[In_R] = {SDL_SCANCODE_D};",
+                "    // [switch2-shoulder-pagekeys-and-minus-v3]\n"
+                "    p.keys[In_Minus] = {};\n"
+                "    p.keys[In_Plus] = p.keys[In_Y];\n"
+                "    p.keys[In_L] = {SDL_SCANCODE_Q, SDL_SCANCODE_PAGEUP};\n"
+                "    p.keys[In_R] = {SDL_SCANCODE_D, SDL_SCANCODE_PAGEDOWN};",
             ),
         ],
     )
@@ -2200,6 +2265,10 @@ def patch_preload_compat_v2() -> None:
             dst.parent.mkdir(parents=True, exist_ok=True)
             write_if_changed(dst, f.read_text(encoding="utf-8"))
             copied += 1
+    # Ruby halves of C extensions compiled into mkxp-z (their .rb lives under ext/<name>/lib)
+    for ext_rb in sorted(lib.parent.glob("ext/pathname/lib/*.rb")):
+        write_if_changed(out / ext_rb.name, ext_rb.read_text(encoding="utf-8"))
+        copied += 1
     print(f"[ok] {copied} stdlib file(s) staged in romfs:/stdlib")
 
 
@@ -3324,6 +3393,7 @@ if __name__ == "__main__":
     patch_src_main()
     patch_rgssad_cp932()
     patch_filesystem_mojibake()
+    patch_fs_rtp_for_self_contained_games()
     patch_audio_missing_graceful()
     patch_bitmap_missing_graceful()
     patch_viewport_disposed_graceful()
