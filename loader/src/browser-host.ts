@@ -3,6 +3,7 @@
  * on nx.js for Nintendo Switch 2 (Skia Ganesh GL over OunceVK + FFmpeg Video).
  */
 import type { AssetReader } from './assets';
+import { decodeUtf8Safe, encodeUtf8Safe } from './node-compat';
 import { RepeatedPattern } from './repeated-pattern';
 import { log } from './log';
 
@@ -38,6 +39,12 @@ export interface BrowserHost {
   ensureWebGLContext(): any;
   getGameCanvas(): any;
   forceStopVideos(): void;
+  getSkippedScripts?(): string[];
+}
+
+/** Rewrites GLSL `lowp`/`mediump` qualifiers (incl. `precision ... float;`) to `highp`. */
+export function promoteShaderPrecision(source: string): string {
+  return source.replace(/\b(?:lowp|mediump)\b/g, 'highp');
 }
 
 export function computeViewport(
@@ -74,10 +81,13 @@ export interface BrowserHostOptions {
 }
 
 /**
- * Patch native CanvasRenderingContext2D.prototype.font setter to strip CSS weight/style tokens
- * ('bold', 'italic', 'oblique'). nx.js's FontFaceSet only registers normal-weight/normal-style
- * faces and otherwise calls addSystemFont() ($.getSystemFont(0)) on every bold/italic font assignment,
- * leaking ~6 MiB of PlSharedFontType_Standard buffers per call!
+ * Patch native CanvasRenderingContext2D / OffscreenCanvasRenderingContext2D `font` property:
+ * 1. Strips CSS weight/style tokens ('bold', 'italic', 'oblique') before calling nx.js's native setter,
+ *    preventing `addSystemFont()` (`$.getSystemFont(0)`) from leaking ~6 MiB of PlSharedFontType_Standard
+ *    buffers per bold/italic call.
+ * 2. Preserves the exact logical CSS `font` string on `this.__drCssFont` so custom JS font renderers
+ *    like `OpenTypePixelFont.js` (`getFont(this.font)`) always see the exact family, size, and italic
+ *    flags (even for virtual font families such as `rmmz-tinyfont` or `Tiny Pixel`).
  */
 export function installFontLeakGuard(ctx: any): void {
   if (!ctx) return;
@@ -87,20 +97,100 @@ export function installFontLeakGuard(ctx: any): void {
     if (fontDesc?.set && !(ctxProto as any).__drFontPatched) {
       (ctxProto as any).__drFontPatched = true;
       const origSetFont = fontDesc.set;
+      const origGetFont = fontDesc.get;
+      let inNativeSetFont = false;
       Object.defineProperty(ctxProto, 'font', {
         configurable: true,
         enumerable: true,
-        get: fontDesc.get,
+        get() {
+          // IMPORTANT: nx.js's native `set font(v)` starts with `if (!v || this.font === v) return;`!
+          // While inside `origSetFont`, we MUST return the real C++ Skia font (`origGetFont`), never
+          // `__drCssFont`, otherwise `this.font === v` short-circuits and Skia never loads the font!
+          if (inNativeSetFont) {
+            return origGetFont ? origGetFont.call(this) : '';
+          }
+          return (this as any).__drCssFont || (origGetFont ? origGetFont.call(this) : '16px sans-serif');
+        },
         set(v: string) {
-          const clean = String(v ?? '').replace(
+          const raw = String(v ?? '').trim();
+          if (!raw) return;
+          const clean = raw.replace(
             /\b(?:italic|oblique|bold|bolder|lighter|[1-9]00)\s+/gi,
             '',
           );
-          return origSetFont.call(this, clean);
+          inNativeSetFont = true;
+          try {
+            origSetFont.call(this, clean);
+          } finally {
+            inNativeSetFont = false;
+          }
+          (this as any).__drCssFont = raw;
         },
       });
     }
   } catch { /* ignore */ }
+}
+
+/**
+ * Mirror plugin-added or overridden text/drawing methods (such as `OpenTypePixelFont.js`'s
+ * `_groupTextForDrawing`, `_measureText`, `measureText`, `_pathText`, `_fillText`, `fillText`,
+ * `_strokeText`, `strokeText`) from `CanvasRenderingContext2D.prototype` onto
+ * `OffscreenCanvasRenderingContext2D.prototype` so `OffscreenCanvas`-backed RPG Maker Bitmaps
+ * render pixel/custom fonts identically to HTMLCanvasElement!
+ */
+export function syncCanvas2DPluginPrototypes(runtime: Record<string, any> = globalThis as any): any[] {
+  const protos: any[] = [];
+  const c2dProto = runtime?.CanvasRenderingContext2D?.prototype;
+  if (c2dProto) protos.push(c2dProto);
+
+  let offProto = runtime?.OffscreenCanvasRenderingContext2D?.prototype ?? null;
+  if (!offProto && typeof runtime?.OffscreenCanvas === 'function') {
+    try {
+      const probe = new runtime.OffscreenCanvas(1, 1).getContext('2d');
+      if (probe) {
+        installFontLeakGuard(probe);
+        offProto = Object.getPrototypeOf(probe);
+      }
+    } catch { /* ignore */ }
+  }
+  if (offProto && offProto !== c2dProto) {
+    protos.push(offProto);
+    if (c2dProto) {
+      const syncKeys = [
+        '_groupTextForDrawing',
+        '_measureText',
+        'measureText',
+        '_pathText',
+        '_fillText',
+        'fillText',
+        '_strokeText',
+        'strokeText',
+      ];
+      for (const key of syncKeys) {
+        if (typeof c2dProto[key] === 'function' && offProto[key] !== c2dProto[key]) {
+          // Only overwrite built-in methods (measureText/fillText/strokeText) when a plugin actually
+          // installed custom OpenType/canvas text hooks or explicitly replaced them.
+          const isCustomHook = key.startsWith('_') || typeof c2dProto._groupTextForDrawing === 'function';
+          if (isCustomHook) {
+            const origOff = typeof offProto[key] === 'function' ? offProto[key] : null;
+            const c2dFn = c2dProto[key];
+            try {
+              offProto[key] = origOff && !key.startsWith('_')
+                ? function (this: any) {
+                    try {
+                      return c2dFn.apply(this, arguments as any);
+                    } catch {
+                      return origOff.apply(this, arguments as any);
+                    }
+                  }
+                : c2dFn;
+            } catch { /* ignore */ }
+          }
+        }
+      }
+    }
+  }
+  return protos;
 }
 
 export function createBrowserHost(
@@ -145,21 +235,43 @@ export function createBrowserHost(
       const origDisable = typeof gl.disable === 'function' ? gl.disable.bind(gl) : null;
       const origTexImage2D = gl.texImage2D.bind(gl);
       const origTexSubImage2D = gl.texSubImage2D.bind(gl);
+      const nativeTexImage2DSource = typeof gl.texImage2DSource === 'function'
+        ? gl.texImage2DSource.bind(gl)
+        : null;
+      const nativeTexSubImage2DSource = typeof gl.texSubImage2DSource === 'function'
+        ? gl.texSubImage2DSource.bind(gl)
+        : null;
       const origUseProgram = typeof gl.useProgram === 'function' ? gl.useProgram.bind(gl) : null;
       const origBindBuffer = typeof gl.bindBuffer === 'function' ? gl.bindBuffer.bind(gl) : null;
+      const origBufferData = typeof gl.bufferData === 'function' ? gl.bufferData.bind(gl) : null;
+      const origBufferSubData = typeof gl.bufferSubData === 'function' ? gl.bufferSubData.bind(gl) : null;
       const origActiveTexture = typeof gl.activeTexture === 'function' ? gl.activeTexture.bind(gl) : null;
       const origBindTexture = typeof gl.bindTexture === 'function' ? gl.bindTexture.bind(gl) : null;
       const origBindRenderbuffer = typeof gl.bindRenderbuffer === 'function' ? gl.bindRenderbuffer.bind(gl) : null;
       const origBindVao = typeof gl.bindVertexArray === 'function' ? gl.bindVertexArray.bind(gl) : null;
       const origGetParameter = typeof gl.getParameter === 'function' ? gl.getParameter.bind(gl) : null;
+      const origIsEnabled = typeof gl.isEnabled === 'function' ? gl.isEnabled.bind(gl) : null;
+      const origBlendFunc = typeof gl.blendFunc === 'function' ? gl.blendFunc.bind(gl) : null;
+      const origBlendFuncSep = typeof gl.blendFuncSeparate === 'function' ? gl.blendFuncSeparate.bind(gl) : null;
+      const origBlendEq = typeof gl.blendEquation === 'function' ? gl.blendEquation.bind(gl) : null;
+      const origBlendEqSep = typeof gl.blendEquationSeparate === 'function' ? gl.blendEquationSeparate.bind(gl) : null;
+      const origColorMask = typeof gl.colorMask === 'function' ? gl.colorMask.bind(gl) : null;
+      const origDepthMask = typeof gl.depthMask === 'function' ? gl.depthMask.bind(gl) : null;
+      const origFrontFace = typeof gl.frontFace === 'function' ? gl.frontFace.bind(gl) : null;
+      const origCullFace = typeof gl.cullFace === 'function' ? gl.cullFace.bind(gl) : null;
+      const origPixelStorei = typeof gl.pixelStorei === 'function' ? gl.pixelStorei.bind(gl) : null;
       const SCISSOR_TEST = gl.SCISSOR_TEST ?? 0x0c11;
+      const BLEND = gl.BLEND ?? 0x0be2;
+      const CULL_FACE = gl.CULL_FACE ?? 0x0b44;
+      const DEPTH_TEST = gl.DEPTH_TEST ?? 0x0b71;
+      const STENCIL_TEST = gl.STENCIL_TEST ?? 0x0b90;
+      const TEXTURE0 = gl.TEXTURE0 ?? 0x84c0;
       let lastScissor: [number, number, number, number] | null = null;
       let lastGlViewport: [number, number, number, number] | null = null;
       let scissorEnabled = false;
 
-      // Track live WebGL object bindings because nx.js's native getParameter() returns null
-      // for *_BINDING / CURRENT_PROGRAM queries (which breaks Live2D Cubism SaveProfile/RestoreProfile,
-      // causing sprites & textboxes to lose their bound textures and render solid white).
+      // Shadow live WebGL state in JS so Live2D Cubism SaveProfile/RestoreProfile, PIXI state sync,
+      // and Spine/Filter passes perform zero C++/Mesa/Zink roundtrips and preserve logical game viewport.
       let boundProgram: any = null;
       let boundArrayBuf: any = null;
       let boundElemBuf: any = null;
@@ -167,10 +279,34 @@ export function createBrowserHost(
       let boundVao: any = null;
       let activeTexSlot = 0;
       const boundTex2D: any[] = new Array(32).fill(null);
+      const boundTexCube: any[] = new Array(32).fill(null);
+      const capState = new Map<number, boolean>([
+        [SCISSOR_TEST, false],
+        [BLEND, false],
+        [CULL_FACE, false],
+        [DEPTH_TEST, false],
+        [STENCIL_TEST, false],
+      ]);
+      let blendSrcRgb = gl.ONE ?? 1;
+      let blendDstRgb = gl.ZERO ?? 0;
+      let blendSrcAlpha = gl.ONE ?? 1;
+      let blendDstAlpha = gl.ZERO ?? 0;
+      let blendEqRgb = gl.FUNC_ADD ?? 0x8006;
+      let blendEqAlpha = gl.FUNC_ADD ?? 0x8006;
+      let colorMaskState: [boolean, boolean, boolean, boolean] = [true, true, true, true];
+      let depthMaskState = true;
+      let frontFaceState = gl.CCW ?? 0x0901;
+      let cullFaceState = gl.BACK ?? 0x0405;
+      let unpackFlipY = false;
+      let unpackPremultiply = false;
+      let unpackAlignment = 4;
+      let glFrameId = 1;
 
       if (origUseProgram) {
         gl.useProgram = function (prog: any) {
-          boundProgram = prog || null;
+          const next = prog || null;
+          if (boundProgram === next) return;
+          boundProgram = next;
           return origUseProgram(prog);
         };
       }
@@ -178,23 +314,70 @@ export function createBrowserHost(
         const ARRAY_BUFFER = gl.ARRAY_BUFFER ?? 0x8892;
         const ELEMENT_ARRAY_BUFFER = gl.ELEMENT_ARRAY_BUFFER ?? 0x8893;
         gl.bindBuffer = function (target: number, buf: any) {
-          if (target === ARRAY_BUFFER) boundArrayBuf = buf || null;
-          else if (target === ELEMENT_ARRAY_BUFFER) boundElemBuf = buf || null;
+          const next = buf || null;
+          if (target === ARRAY_BUFFER) boundArrayBuf = next;
+          else if (target === ELEMENT_ARRAY_BUFFER) boundElemBuf = next;
           return origBindBuffer(target, buf);
+        };
+        if (origBufferData) {
+          gl.bufferData = function (...args: any[]) {
+            if (args.length === 3) {
+              const target = args[0];
+              const src = args[1];
+              const curBuf = target === ARRAY_BUFFER ? boundArrayBuf : (target === ELEMENT_ARRAY_BUFFER ? boundElemBuf : null);
+              if (curBuf && src && ArrayBuffer.isView(src)) {
+                if (curBuf.__drImmutableBuf) return;
+                if (curBuf.__drSubDataSize === src.byteLength && origBufferSubData) {
+                  if (curBuf.__drUploadedFrame === glFrameId) return;
+                  curBuf.__drUploadedFrame = glFrameId;
+                  return origBufferSubData(target, 0, src);
+                }
+                if (curBuf.__drSubDataSize !== undefined) {
+                  curBuf.__drSubDataSize = src.byteLength;
+                  curBuf.__drUploadedFrame = glFrameId;
+                }
+              }
+            }
+            return origBufferData(...args);
+          };
+        }
+      }
+      if (typeof gl.shaderSource === 'function') {
+        // Shaders ask for mediump; desktop GPUs run that at full 32-bit precision, but this GPU honours it
+        // as 16-bit. MZ's tilemap shader works in atlas pixel coordinates up to 2048 and clamps to the tile
+        // rect: at 16 bits values above 1024 are only accurate to 1 px, so tiles sample their neighbour's
+        // edge -> thin dark horizontal/vertical seams. Force highp everywhere (same output as on PC).
+        const origShaderSource = gl.shaderSource.bind(gl);
+        gl.shaderSource = function (shader: any, source: string) {
+          return origShaderSource(shader, typeof source === 'string' ? promoteShaderPrecision(source) : source);
+        };
+      }
+      if (origBufferSubData) {
+        // PIXI v5 (MZ) uploads empty Float32Arrays for empty geometry; that's a no-op but raises
+        // GL_INVALID_VALUE (0x501) on this driver and hides real errors in the perf log.
+        gl.bufferSubData = function (...args: any[]) {
+          const src = args[2];
+          if (src && ArrayBuffer.isView(src) && src.byteLength === 0) return;
+          return origBufferSubData(...args);
         };
       }
       if (origActiveTexture) {
-        const TEXTURE0 = gl.TEXTURE0 ?? 0x84c0;
         gl.activeTexture = function (unit: number) {
           const idx = (unit | 0) - TEXTURE0;
-          if (idx >= 0 && idx < boundTex2D.length) activeTexSlot = idx;
+          if (idx >= 0 && idx < boundTex2D.length) {
+            if (activeTexSlot === idx) return;
+            activeTexSlot = idx;
+          }
           return origActiveTexture(unit);
         };
       }
       if (origBindTexture) {
         const TEXTURE_2D = gl.TEXTURE_2D ?? 0x0de1;
+        const TEXTURE_CUBE_MAP = gl.TEXTURE_CUBE_MAP ?? 0x8513;
         gl.bindTexture = function (target: number, tex: any) {
-          if (target === TEXTURE_2D) boundTex2D[activeTexSlot] = tex || null;
+          const next = tex || null;
+          if (target === TEXTURE_2D) boundTex2D[activeTexSlot] = next;
+          else if (target === TEXTURE_CUBE_MAP) boundTexCube[activeTexSlot] = next;
           return origBindTexture(target, tex);
         };
       }
@@ -210,6 +393,91 @@ export function createBrowserHost(
           return origBindVao(vao);
         };
       }
+      if (origBlendFunc) {
+        gl.blendFunc = function (sfactor: number, dfactor: number) {
+          const s = sfactor | 0;
+          const d = dfactor | 0;
+          if (blendSrcRgb === s && blendDstRgb === d && blendSrcAlpha === s && blendDstAlpha === d) return;
+          blendSrcRgb = blendSrcAlpha = s;
+          blendDstRgb = blendDstAlpha = d;
+          return origBlendFunc(s, d);
+        };
+      }
+      if (origBlendFuncSep) {
+        gl.blendFuncSeparate = function (srcRGB: number, dstRGB: number, srcAlpha: number, dstAlpha: number) {
+          const sr = srcRGB | 0, dr = dstRGB | 0, sa = srcAlpha | 0, da = dstAlpha | 0;
+          if (blendSrcRgb === sr && blendDstRgb === dr && blendSrcAlpha === sa && blendDstAlpha === da) return;
+          blendSrcRgb = sr; blendDstRgb = dr; blendSrcAlpha = sa; blendDstAlpha = da;
+          return origBlendFuncSep(sr, dr, sa, da);
+        };
+      }
+      if (origBlendEq) {
+        gl.blendEquation = function (mode: number) {
+          const m = mode | 0;
+          if (blendEqRgb === m && blendEqAlpha === m) return;
+          blendEqRgb = blendEqAlpha = m;
+          return origBlendEq(m);
+        };
+      }
+      if (origBlendEqSep) {
+        gl.blendEquationSeparate = function (modeRGB: number, modeAlpha: number) {
+          const mr = modeRGB | 0, ma = modeAlpha | 0;
+          if (blendEqRgb === mr && blendEqAlpha === ma) return;
+          blendEqRgb = mr; blendEqAlpha = ma;
+          return origBlendEqSep(mr, ma);
+        };
+      }
+      if (origColorMask) {
+        gl.colorMask = function (r: boolean, g: boolean, b: boolean, a: boolean) {
+          const br = Boolean(r), bg = Boolean(g), bb = Boolean(b), ba = Boolean(a);
+          if (
+            colorMaskState[0] === br &&
+            colorMaskState[1] === bg &&
+            colorMaskState[2] === bb &&
+            colorMaskState[3] === ba
+          ) return;
+          colorMaskState = [br, bg, bb, ba];
+          return origColorMask(br, bg, bb, ba);
+        };
+      }
+      if (origDepthMask) {
+        gl.depthMask = function (flag: boolean) {
+          const bf = Boolean(flag);
+          if (depthMaskState === bf) return;
+          depthMaskState = bf;
+          return origDepthMask(bf);
+        };
+      }
+      if (origFrontFace) {
+        gl.frontFace = function (mode: number) {
+          const m = mode | 0;
+          if (frontFaceState === m) return;
+          frontFaceState = m;
+          return origFrontFace(m);
+        };
+      }
+      if (origCullFace) {
+        gl.cullFace = function (mode: number) {
+          const m = mode | 0;
+          if (cullFaceState === m) return;
+          cullFaceState = m;
+          return origCullFace(m);
+        };
+      }
+      if (origPixelStorei) {
+        gl.pixelStorei = function (pname: number, param: any) {
+          if (pname === 0x9240) unpackFlipY = Boolean(param);
+          else if (pname === 0x9241) unpackPremultiply = Boolean(param);
+          else if (pname === 0x0cf5) unpackAlignment = Number(param) || 4;
+          return origPixelStorei(pname, param);
+        };
+      }
+      if (origIsEnabled) {
+        gl.isEnabled = function (cap: number) {
+          if (capState.has(cap)) return capState.get(cap)!;
+          return origIsEnabled(cap);
+        };
+      }
       gl.__drBoundProgram = () => boundProgram;
       gl.__drBoundTex2D = (slot: number) => boundTex2D[slot] ?? null;
 
@@ -218,18 +486,63 @@ export function createBrowserHost(
         const ARRAY_BUFFER_BINDING = gl.ARRAY_BUFFER_BINDING ?? 0x8894;
         const ELEMENT_ARRAY_BUFFER_BINDING = gl.ELEMENT_ARRAY_BUFFER_BINDING ?? 0x8895;
         const TEXTURE_BINDING_2D = gl.TEXTURE_BINDING_2D ?? 0x8069;
+        const TEXTURE_BINDING_CUBE_MAP = gl.TEXTURE_BINDING_CUBE_MAP ?? 0x8514;
         const FRAMEBUFFER_BINDING = gl.FRAMEBUFFER_BINDING ?? 0x8ca6;
         const RENDERBUFFER_BINDING = gl.RENDERBUFFER_BINDING ?? 0x8ca7;
         const VERTEX_ARRAY_BINDING = gl.VERTEX_ARRAY_BINDING ?? 0x85b5;
+        const ACTIVE_TEXTURE = gl.ACTIVE_TEXTURE ?? 0x84e0;
+        const VIEWPORT = gl.VIEWPORT ?? 0x0ba2;
+        const SCISSOR_BOX = gl.SCISSOR_BOX ?? 0x0c10;
+        const COLOR_WRITEMASK = gl.COLOR_WRITEMASK ?? 0x0c23;
+        const DEPTH_WRITEMASK = gl.DEPTH_WRITEMASK ?? 0x0b72;
+        const FRONT_FACE = gl.FRONT_FACE ?? 0x0b46;
+        const CULL_FACE_MODE = gl.CULL_FACE_MODE ?? 0x0b45;
+        const BLEND_DST_RGB = gl.BLEND_DST_RGB ?? 0x80c8;
+        const BLEND_SRC_RGB = gl.BLEND_SRC_RGB ?? 0x80c9;
+        const BLEND_DST_ALPHA = gl.BLEND_DST_ALPHA ?? 0x80ca;
+        const BLEND_SRC_ALPHA = gl.BLEND_SRC_ALPHA ?? 0x80cb;
+        const BLEND_EQUATION_RGB = gl.BLEND_EQUATION_RGB ?? 0x8009;
+        const BLEND_EQUATION_ALPHA = gl.BLEND_EQUATION_ALPHA ?? 0x883d;
         gl.getParameter = function (pname: number) {
           switch (pname) {
             case CURRENT_PROGRAM: return boundProgram;
             case ARRAY_BUFFER_BINDING: return boundArrayBuf;
             case ELEMENT_ARRAY_BUFFER_BINDING: return boundElemBuf;
             case TEXTURE_BINDING_2D: return boundTex2D[activeTexSlot] ?? null;
+            case TEXTURE_BINDING_CUBE_MAP: return boundTexCube[activeTexSlot] ?? null;
             case FRAMEBUFFER_BINDING: return webglDrawFbo;
             case RENDERBUFFER_BINDING: return boundRenderbuffer;
             case VERTEX_ARRAY_BINDING: return boundVao;
+            case ACTIVE_TEXTURE: return TEXTURE0 + activeTexSlot;
+            case VIEWPORT: {
+              if (lastGlViewport) return new Int32Array(lastGlViewport);
+              const vp = refreshViewport();
+              return new Int32Array([0, 0, vp.gw, vp.gh]);
+            }
+            case SCISSOR_BOX: {
+              if (lastScissor) return new Int32Array(lastScissor);
+              const vp = refreshViewport();
+              return new Int32Array([0, 0, vp.gw, vp.gh]);
+            }
+            case SCISSOR_TEST: return scissorEnabled;
+            case BLEND:
+            case CULL_FACE:
+            case DEPTH_TEST:
+            case STENCIL_TEST:
+              return capState.get(pname) ?? false;
+            case COLOR_WRITEMASK: return colorMaskState.slice();
+            case DEPTH_WRITEMASK: return depthMaskState;
+            case FRONT_FACE: return frontFaceState;
+            case CULL_FACE_MODE: return cullFaceState;
+            case BLEND_SRC_RGB: return blendSrcRgb;
+            case BLEND_DST_RGB: return blendDstRgb;
+            case BLEND_SRC_ALPHA: return blendSrcAlpha;
+            case BLEND_DST_ALPHA: return blendDstAlpha;
+            case BLEND_EQUATION_RGB: return blendEqRgb;
+            case BLEND_EQUATION_ALPHA: return blendEqAlpha;
+            case 0x9240: return unpackFlipY;
+            case 0x9241: return unpackPremultiply;
+            case 0x0cf5: return unpackAlignment;
             default: return origGetParameter(pname);
           }
         };
@@ -246,6 +559,9 @@ export function createBrowserHost(
 
       let glDrawCount = 0;
       let glTexUploadCount = 0;
+      let glTexUploadMs = 0;
+      let glTexUploadMaxMs = 0;
+      let glTexUploadMaxPx = 0;
       let glRbFixCount = 0;
 
       // OpenGL ES 3.0 requires sized internal formats for glRenderbufferStorage (unlike
@@ -314,12 +630,86 @@ export function createBrowserHost(
           return res;
         };
       }
-      gl.__drGetStats = () => ({
-        draws: glDrawCount,
-        texUploads: glTexUploadCount,
-        rbFixes: glRbFixCount,
-        err: typeof gl.getError === 'function' ? gl.getError() : -1,
-      });
+      // One-shot GL error tracer: the periodic perf check only sees that SOME call failed since the
+      // last check (e.g. glErr=0x501). The first time that happens, check getError() after every GL call
+      // for ~10 s and log each distinct failing call with its arguments, then restore the originals.
+      const origGetError = typeof gl.getError === 'function' ? gl.getError.bind(gl) : null;
+      let errTraceState: 'idle' | 'tracing' | 'done' = 'idle';
+      const describeGlArg = (a: any): string => {
+        if (a === null || a === undefined) return String(a);
+        if (typeof a === 'number') return Number.isInteger(a) && a > 255 ? `0x${a.toString(16)}` : String(a);
+        if (typeof a === 'boolean' || typeof a === 'string') return String(a);
+        if (ArrayBuffer.isView(a)) return `${a.constructor?.name}[${(a as any).length}]`;
+        if (a instanceof ArrayBuffer) return `ArrayBuffer[${a.byteLength}]`;
+        return a.constructor?.name || typeof a;
+      };
+      const startErrTrace = () => {
+        if (errTraceState !== 'idle' || !origGetError) return;
+        errTraceState = 'tracing';
+        const saved = new Map<string, any>();
+        const seen = new Set<string>();
+        let logged = 0;
+        const keys = new Set<string>();
+        for (let o = gl; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+          for (const k of Object.getOwnPropertyNames(o)) keys.add(k);
+        }
+        for (const k of keys) {
+          if (k === 'getError' || k.startsWith('__dr') || k === 'constructor') continue;
+          let fn: any;
+          try { fn = gl[k]; } catch { continue; }
+          if (typeof fn !== 'function') continue;
+          saved.set(k, Object.prototype.hasOwnProperty.call(gl, k) ? fn : undefined);
+          gl[k] = function (...args: any[]) {
+            const r = fn.apply(gl, args);
+            const e = origGetError();
+            if (e && logged < 12) {
+              const sig = `${k}:${e}`;
+              if (!seen.has(sig)) {
+                seen.add(sig);
+                logged++;
+                let extra = '';
+                if (k === 'bufferSubData' || k === 'bufferData') {
+                  try {
+                    const target = args[0];
+                    const size = gl.getBufferParameter?.(target, gl.BUFFER_SIZE ?? 0x8764);
+                    extra = ` boundBufferSize=${size}`;
+                  } catch { /* ignore */ }
+                }
+                log(`[webgl] GL error 0x${(e >>> 0).toString(16)} from ${k}(${args.map(describeGlArg).join(', ')})${extra}`);
+              }
+            }
+            return r;
+          };
+        }
+        log('[webgl] GL error seen -> tracing failing GL calls for ~10s');
+        setTimeout(() => {
+          for (const [k, fn] of saved) {
+            if (fn === undefined) delete gl[k];
+            else gl[k] = fn;
+          }
+          errTraceState = 'done';
+          log(`[webgl] GL error trace finished (${seen.size} distinct failing call(s))`);
+        }, 10000);
+      };
+      // Cheap per-frame counters (no getError round trip): [uploads, uploadMs, maxUploadMs, maxUploadPx]
+      gl.__drTexCounters = () => [glTexUploadCount, glTexUploadMs, glTexUploadMaxMs, glTexUploadMaxPx];
+      gl.__drResetTexMax = () => {
+        glTexUploadMaxMs = 0;
+        glTexUploadMaxPx = 0;
+      };
+      gl.__drGetStats = () => {
+        const err = origGetError ? origGetError() : -1;
+        if (err > 0) startErrTrace();
+        return {
+          draws: glDrawCount,
+          texUploads: glTexUploadCount,
+          texUploadMs: glTexUploadMs,
+          texUploadMaxMs: glTexUploadMaxMs,
+          texUploadMaxPx: glTexUploadMaxPx,
+          rbFixes: glRbFixCount,
+          err,
+        };
+      };
 
       const FRAMEBUFFER = gl.FRAMEBUFFER ?? 0x8d40;
       const DRAW_FRAMEBUFFER = gl.DRAW_FRAMEBUFFER ?? 0x8ca9;
@@ -383,6 +773,7 @@ export function createBrowserHost(
         if (scissorEnabled) syncScissorForCurrentFbo();
       };
       gl.__drClearScreen = () => {
+        glFrameId = (glFrameId + 1) | 0;
         const prevRaw = webglRawViewport;
         webglRawViewport = true;
         try {
@@ -410,7 +801,13 @@ export function createBrowserHost(
         gl.enable = function (cap: number) {
           if (cap === SCISSOR_TEST) {
             scissorEnabled = true;
+            capState.set(SCISSOR_TEST, true);
             syncScissorForCurrentFbo();
+            return origEnable(cap);
+          }
+          if (capState.has(cap)) {
+            if (capState.get(cap) === true) return;
+            capState.set(cap, true);
           }
           return origEnable(cap);
         };
@@ -419,6 +816,12 @@ export function createBrowserHost(
         gl.disable = function (cap: number) {
           if (cap === SCISSOR_TEST) {
             scissorEnabled = false;
+            capState.set(SCISSOR_TEST, false);
+            return origDisable(cap);
+          }
+          if (capState.has(cap)) {
+            if (capState.get(cap) === false) return;
+            capState.set(cap, false);
           }
           return origDisable(cap);
         };
@@ -473,8 +876,18 @@ export function createBrowserHost(
         return origScissor(rx, ry, rw, rh);
       };
 
-      // Fast CanvasNode / OffscreenCanvas -> Uint8Array RGBA extraction so PIXI v5 uploads
-      // Bitmaps & overlays directly without allocating temporary OffscreenCanvas copies.
+      // Unwrap CanvasNode / OffscreenCanvas / native Image so C++ `texImage2DSource` uploads
+      // premultiplied BGRA8 directly via ARM64 NEON with zero intermediate OffscreenCanvas or
+      // getImageData float-division allocations!
+      const unwrapNativeTexSource = (src: any): any | null => {
+        if (!src || typeof src !== 'object' || ArrayBuffer.isView(src) || src instanceof VideoNode) return null;
+        if (src instanceof CanvasNode) return src.surface();
+        if (typeof OffscreenCanvas !== 'undefined' && src instanceof OffscreenCanvas) return src;
+        if (typeof src.width === 'number' && typeof src.height === 'number' && !('data' in src)) return src;
+        return null;
+      };
+
+      // Fallback CanvasNode / OffscreenCanvas -> Uint8Array RGBA extraction when native fast-path is absent.
       const extractCanvasPixels = (src: any): { data: Uint8Array; w: number; h: number } | null => {
         if (!src || typeof src !== 'object') return null;
         let surf: any = null;
@@ -496,9 +909,28 @@ export function createBrowserHost(
         };
       };
 
-      gl.texImage2D = function (...args: any[]) {
-        glTexUploadCount++;
+      const texImage2DInner = function (...args: any[]) {
         const last = args[args.length - 1];
+        if (last instanceof VideoNode && last.nativeVideo) {
+          const copy = args.slice();
+          copy[copy.length - 1] = last.nativeVideo;
+          return origTexImage2D(...copy);
+        }
+        if (nativeTexImage2DSource) {
+          const nativeSrc = unwrapNativeTexSource(last);
+          if (nativeSrc) {
+            if (args.length === 6) {
+              if (nativeTexImage2DSource(args[0], args[1], args[2], args[3], args[4], nativeSrc) === true) return;
+            } else if (
+              args.length === 9 &&
+              args[3] === nativeSrc.width &&
+              args[4] === nativeSrc.height &&
+              args[5] === 0
+            ) {
+              if (nativeTexImage2DSource(args[0], args[1], args[2], args[6], args[7], nativeSrc) === true) return;
+            }
+          }
+        }
         const px = extractCanvasPixels(last);
         if (px) {
           if (args.length === 6) {
@@ -511,9 +943,27 @@ export function createBrowserHost(
         return origTexImage2D(...args);
       };
 
-      gl.texSubImage2D = function (...args: any[]) {
-        glTexUploadCount++;
+      const texSubImage2DInner = function (...args: any[]) {
         const last = args[args.length - 1];
+        if (last instanceof VideoNode && last.nativeVideo) {
+          const copy = args.slice();
+          copy[copy.length - 1] = last.nativeVideo;
+          return origTexSubImage2D(...copy);
+        }
+        if (nativeTexSubImage2DSource) {
+          const nativeSrc = unwrapNativeTexSource(last);
+          if (nativeSrc) {
+            if (args.length === 7) {
+              if (nativeTexSubImage2DSource(args[0], args[1], args[2], args[3], args[4], args[5], nativeSrc) === true) return;
+            } else if (
+              args.length === 9 &&
+              args[4] === nativeSrc.width &&
+              args[5] === nativeSrc.height
+            ) {
+              if (nativeTexSubImage2DSource(args[0], args[1], args[2], args[3], args[6], args[7], nativeSrc) === true) return;
+            }
+          }
+        }
         const px = extractCanvasPixels(last);
         if (px) {
           if (args.length === 7) {
@@ -525,6 +975,35 @@ export function createBrowserHost(
         }
         return origTexSubImage2D(...args);
       };
+
+      // Time every texture upload: canvas-backed textures (text, lighting layers) are converted to
+      // pixels here, and a large one costs tens of ms -> shows up as periodic frame hitches.
+      // texImage2D(target, level, ifmt, w, h, border, fmt, type, pixels) / texSubImage2D(target, level,
+      // x, y, w, h, fmt, type, pixels); the 6/7-argument forms take a canvas/image source last.
+      const uploadSize = (args: any[], sub: boolean): number => {
+        const last = args[args.length - 1];
+        if (last && typeof last.width === 'number' && typeof last.height === 'number') return last.width * last.height;
+        if (args.length < 9) return 0;
+        const w = Number(args[sub ? 4 : 3]) || 0;
+        const h = Number(args[sub ? 5 : 4]) || 0;
+        return w * h;
+      };
+      const timedUpload = (inner: (...a: any[]) => any, sub: boolean) => function (...args: any[]) {
+        glTexUploadCount++;
+        const t0 = performance.now();
+        try {
+          return inner(...args);
+        } finally {
+          const ms = performance.now() - t0;
+          glTexUploadMs += ms;
+          if (ms > glTexUploadMaxMs) {
+            glTexUploadMaxMs = ms;
+            glTexUploadMaxPx = uploadSize(args, sub);
+          }
+        }
+      };
+      gl.texImage2D = timedUpload(texImage2DInner, false);
+      gl.texSubImage2D = timedUpload(texSubImage2DInner, true);
 
       gl.getContextAttributes = () => ({
         alpha: true,
@@ -554,6 +1033,7 @@ export function createBrowserHost(
         if (lower === 'angle_instanced_arrays' && instExt) return instExt;
         if (lower === 'oes_element_index_uint') return {};
         if (lower === 'webgl_depth_texture') return { UNSIGNED_INT_24_8_WEBGL: gl.UNSIGNED_INT_24_8 ?? 0x84fa };
+        if (lower === 'webgl_lose_context') return { loseContext() {}, restoreContext() {} };
         return origGetExt ? origGetExt(name) : null;
       };
 
@@ -693,13 +1173,25 @@ export function createBrowserHost(
     return source.replace(/\uFFFD@/g, '  ').replace(/\uFFFD/g, ' ');
   }
 
+  const skippedScripts: string[] = [];
+  const seenMissingScripts = new Set<string>();
+  const seenFailedXhr = new Set<string>();
+
+  function recordSkippedScript(path: string): void {
+    const clean = path.split('/').pop() || path;
+    if (!skippedScripts.includes(clean)) skippedScripts.push(clean);
+  }
+
   function enqueueScript(path: string, onDone?: () => void, onErr?: (e: unknown) => void): Promise<void> {
     pendingCount++;
     const job = scriptChain.then(async () => {
       const rawBytes = await assets.read(path);
       if (!rawBytes) {
         const err = new Error(`Script not found: ${path}`);
-        log(`[script] MISSING: ${path}`);
+        if (!seenMissingScripts.has(path) && seenMissingScripts.size < 40) {
+          seenMissingScripts.add(path);
+          log(`[script] MISSING: ${path}`);
+        }
         onErr?.(err);
         return;
       }
@@ -707,12 +1199,13 @@ export function createBrowserHost(
       const source = decodeScriptBytes(bytes);
       const prepared = filter(path, source);
       if (prepared === null) {
-        log(`[script] skipped PC-only plugin: ${path}`);
+        recordSkippedScript(path);
         onDone?.();
         return;
       }
       const scriptEl = new ScriptNode();
       scriptEl.src = path;
+      const prevCurrentScript = document.currentScript;
       document.currentScript = scriptEl;
       try {
         try {
@@ -746,7 +1239,7 @@ export function createBrowserHost(
         }
         onErr?.(err);
       } finally {
-        document.currentScript = null;
+        document.currentScript = prevCurrentScript;
       }
     }).finally(() => {
       pendingCount--;
@@ -755,10 +1248,41 @@ export function createBrowserHost(
     return job;
   }
 
+  function createDomStyle(): Record<string, any> {
+    let rawFont = '';
+    const st: Record<string, any> = {
+      fontStyle: 'normal',
+      fontWeight: 'normal',
+      fontSize: '16px',
+      fontFamily: '',
+    };
+    Object.defineProperty(st, 'font', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return rawFont;
+      },
+      set(v: unknown) {
+        const s = String(v ?? '').trim();
+        rawFont = s;
+        if (!s) return;
+        st.fontStyle = /\b(?:italic|oblique)\b/i.test(s) ? 'italic' : 'normal';
+        const wm = /\b(bold|bolder|lighter|[1-9]00)\b/i.exec(s);
+        st.fontWeight = wm ? wm[1].toLowerCase() : 'normal';
+        const sm = /(\d+(?:\.\d+)?(?:px|pt|em|rem|%))(?:\s*\/\s*[^\s]+)?\s+(.+)$/i.exec(s);
+        if (sm) {
+          st.fontSize = sm[1];
+          st.fontFamily = sm[2].trim();
+        }
+      },
+    });
+    return st;
+  }
+
   class DomNode extends EventTarget {
     children: DomNode[] = [];
     parentNode: DomNode | null = null;
-    style: Record<string, any> = {};
+    style: Record<string, any> = createDomStyle();
     attributes: Record<string, string> = {};
     id = '';
     className = '';
@@ -774,12 +1298,47 @@ export function createBrowserHost(
         viewportDirty = true;
         if (!enableWebGL) child.enableDirectScreen();
       }
-      if (child instanceof ScriptNode && child.src) {
-        void enqueueScript(
-          child.src,
-          () => child.onload?.(),
-          (e) => child.onerror?.(e),
-        );
+      if (child instanceof ScriptNode) {
+        if (child.src) {
+          void enqueueScript(
+            child.src,
+            () => child.onload?.(),
+            (e) => child.onerror?.(e),
+          );
+        } else {
+          const inlineSource = child.textContent || child.innerHTML;
+          if (inlineSource) {
+            const vpath = child._url || 'inline-script.js';
+            const prepared = filter(vpath, inlineSource);
+            if (prepared === null) {
+              recordSkippedScript(vpath);
+              child.onload?.();
+            } else {
+              const prevScript = document.currentScript;
+              document.currentScript = child;
+              try {
+                try {
+                  (0, eval)(`${prepared}\n//# sourceURL=${vpath}`);
+                } catch (firstErr) {
+                  if (firstErr instanceof SyntaxError && prepared.includes('\uFFFD')) {
+                    const sanitized = sanitizeShiftJisScript(prepared);
+                    log(`[script] retrying ${vpath} after Shift-JIS/non-UTF8 sanitization`);
+                    (0, eval)(`${sanitized}\n//# sourceURL=${vpath}`);
+                  } else {
+                    throw firstErr;
+                  }
+                }
+                child.onload?.();
+              } catch (err) {
+                const msg = err instanceof Error ? (err.stack || `${err.name}: ${err.message}`) : String(err);
+                log(`[script] ERROR in ${vpath}: ${msg}`);
+                child.onerror?.({ target: child, error: err });
+              } finally {
+                document.currentScript = prevScript;
+              }
+            }
+          }
+        }
       }
       return child;
     }
@@ -809,6 +1368,7 @@ export function createBrowserHost(
         if (upper === '*' || ch.tagName === upper) out.push(ch);
         out.push(...ch.getElementsByTagName(name));
       }
+      (out as any).item = (i: number) => out[i] ?? null;
       return out;
     }
     getBoundingClientRect() {
@@ -822,6 +1382,7 @@ export function createBrowserHost(
 
   class ScriptNode extends DomNode {
     src = '';
+    _url = '';
     type = 'text/javascript';
     async = false;
     onload: (() => void) | null = null;
@@ -834,6 +1395,17 @@ export function createBrowserHost(
    * directly from `sdmc:/.../www/movies/*.webm` with integrated WebAudio).
    */
   class VideoNode extends DomNode {
+    static readonly HAVE_NOTHING = 0;
+    static readonly HAVE_METADATA = 1;
+    static readonly HAVE_CURRENT_DATA = 2;
+    static readonly HAVE_FUTURE_DATA = 3;
+    static readonly HAVE_ENOUGH_DATA = 4;
+    readonly HAVE_NOTHING = 0;
+    readonly HAVE_METADATA = 1;
+    readonly HAVE_CURRENT_DATA = 2;
+    readonly HAVE_FUTURE_DATA = 3;
+    readonly HAVE_ENOUGH_DATA = 4;
+
     private _src = '';
     private _loop = false;
     private _volume = 1;
@@ -929,7 +1501,11 @@ export function createBrowserHost(
 
     private _attachNative(rawUrl: string) {
       const NativeVideo = (globalThis as any).Video;
-      const resolved = rawUrl.startsWith('sdmc:/') ? rawUrl : assets.resolvePath(rawUrl);
+      const resolved = rawUrl.startsWith('sdmc:/')
+        ? rawUrl
+        : (assets.resolvePath(rawUrl) ??
+          assets.resolvePath(`${rawUrl}.webm`) ??
+          assets.resolvePath(`${rawUrl}.mp4`));
       if (!NativeVideo || !resolved) {
         log(`[video] fallback skip (unavailable): ${rawUrl}`);
         this._readyState = 4;
@@ -1008,7 +1584,27 @@ export function createBrowserHost(
       }
     }
 
+    override appendChild<T extends DomNode>(child: T): T {
+      super.appendChild(child);
+      if (!this._src && child.tagName === 'SOURCE') {
+        const childSrc = String((child as any).src || child.attributes?.src || '');
+        if (childSrc) this._src = childSrc;
+      }
+      return child;
+    }
+
     load(): void {
+      if (!this._src) {
+        for (const ch of this.children) {
+          if (ch.tagName === 'SOURCE') {
+            const childSrc = String((ch as any).src || ch.attributes?.src || '');
+            if (childSrc) {
+              this._src = childSrc;
+              break;
+            }
+          }
+        }
+      }
       if (this._src && !this._native) this._attachNative(this._src);
     }
 
@@ -1130,6 +1726,7 @@ export function createBrowserHost(
 
       const target = this.direct ? screenCtx : this.surface().getContext('2d');
       if (!target) return null;
+      installFontLeakGuard(target);
 
       const owner = this;
       let activePattern: RepeatedPattern | null = null;
@@ -1212,6 +1809,54 @@ export function createBrowserHost(
         if (!src) return;
         return target.drawImage(src, ...args);
       };
+      wrapper.fillText = (text: any, x: number, y: number, maxWidth?: number) => {
+        owner.revision++;
+        return maxWidth === undefined ? target.fillText(text, x, y) : target.fillText(text, x, y, maxWidth);
+      };
+      wrapper.strokeText = (text: any, x: number, y: number, maxWidth?: number) => {
+        owner.revision++;
+        return maxWidth === undefined ? target.strokeText(text, x, y) : target.strokeText(text, x, y, maxWidth);
+      };
+
+      // Fast scalar HarfBuzz text width binding (`$.canvasContext2dMeasureTextWidth`) + memoized
+      // `ctx.measureText` so direct canvas text measurement (CBR_Status_main, PIXI.Text, MV Bitmap)
+      // avoids double HarfBuzz shaping, SkFont::getBounds, and 12-property V8 TextMetrics allocs,
+      // while deferring to plugin text renderers (e.g. OpenTypePixelFont.js) when installed!
+      const nativeMeasureWidth = typeof (globalThis as any).$?.canvasContext2dMeasureTextWidth === 'function'
+        ? (globalThis as any).$.canvasContext2dMeasureTextWidth.bind((globalThis as any).$)
+        : null;
+      if (nativeMeasureWidth) {
+        wrapper.__drMeasureTextWidth = (text: string): number => {
+          if (typeof (target as any)._groupTextForDrawing === 'function') {
+            return Number((target as any).measureText(text)?.width) || 0;
+          }
+          return nativeMeasureWidth(target, text);
+        };
+        wrapper.measureText = (text: any, maxWidth?: any) => {
+          if (typeof (target as any)._groupTextForDrawing === 'function') {
+            return (target as any).measureText(text, maxWidth);
+          }
+          const str = String(text ?? '');
+          const w = str.length === 0 ? 0 : nativeMeasureWidth(target, str);
+          return {
+            width: w,
+            actualBoundingBoxLeft: 0,
+            actualBoundingBoxRight: w,
+            actualBoundingBoxAscent: 0,
+            actualBoundingBoxDescent: 0,
+            fontBoundingBoxAscent: 0,
+            fontBoundingBoxDescent: 0,
+            emHeightAscent: 0,
+            emHeightDescent: 0,
+            hangingBaseline: 0,
+            alphabeticBaseline: 0,
+            ideographicBaseline: 0,
+          };
+        };
+      } else {
+        wrapper.measureText = (text: any, maxWidth?: any) => target.measureText(text, maxWidth);
+        wrapper.__drMeasureTextWidth = (text: string): number => Number(target.measureText(text)?.width) || 0;
+      }
 
       // Bounds-safe getImageData: nx.js's native canvasContext2dGetImageData underflows
       // size_t (RangeError: failed to allocate 18446744073709550904 bytes) when sx/sy are
@@ -1492,7 +2137,7 @@ export function createBrowserHost(
             };
           }
         }
-        const directDrawKeys = ['strokeRect', 'fillText', 'strokeText', 'putImageData', 'stroke'];
+        const directDrawKeys = ['strokeRect', 'putImageData', 'stroke'];
         for (const key of directDrawKeys) {
           const fn = target[key];
           if (typeof fn === 'function') {
@@ -1503,6 +2148,16 @@ export function createBrowserHost(
             };
           }
         }
+        wrapper.fillText = (text: any, x: number, y: number, maxWidth?: number) => {
+          owner.revision++;
+          syncDeviceMatrix();
+          return maxWidth === undefined ? target.fillText(text, x, y) : target.fillText(text, x, y, maxWidth);
+        };
+        wrapper.strokeText = (text: any, x: number, y: number, maxWidth?: number) => {
+          owner.revision++;
+          syncDeviceMatrix();
+          return maxWidth === undefined ? target.strokeText(text, x, y) : target.strokeText(text, x, y, maxWidth);
+        };
         wrapper.fill = (...args: any[]) => {
           owner.revision++;
           syncDeviceMatrix();
@@ -1516,7 +2171,7 @@ export function createBrowserHost(
           return target.fill(...args);
         };
       } else {
-        const drawKeys = ['clearRect', 'strokeRect', 'fillText', 'strokeText', 'putImageData', 'stroke'];
+        const drawKeys = ['clearRect', 'strokeRect', 'putImageData', 'stroke'];
         for (const key of drawKeys) {
           const fn = target[key];
           if (typeof fn === 'function') {
@@ -1622,7 +2277,10 @@ export function createBrowserHost(
           this._fire('readystatechange');
           this._fire('load');
         } catch (err) {
-          log(`[xhr] FAILED ${url}: ${String(err)}`);
+          if (!seenFailedXhr.has(url) && seenFailedXhr.size < 40) {
+            seenFailedXhr.add(url);
+            log(`[xhr] FAILED ${url}: ${String(err)}`);
+          }
           this.status = 0;
           this.readyState = 4;
           this._fire('readystatechange');
@@ -1635,6 +2293,10 @@ export function createBrowserHost(
   const head = new DomNode('HEAD');
   const body = new DomNode('BODY');
   const htmlEl = new DomNode('HTML');
+  const withItem = <T>(arr: T[]): T[] => {
+    (arr as any).item = (i: number) => arr[i] ?? null;
+    return arr;
+  };
 
   const document: any = new (class extends EventTarget {
     readyState = 'complete';
@@ -1662,6 +2324,18 @@ export function createBrowserHost(
         case 'script': return new ScriptNode();
         case 'video':
         case 'audio': return new VideoNode(tag.toUpperCase());
+        case 'style': {
+          const st = new DomNode('STYLE') as any;
+          st.sheet = {
+            cssRules: [] as string[],
+            insertRule(rule: string, idx = 0) {
+              this.cssRules.splice(Math.max(0, Math.min(this.cssRules.length, idx)), 0, String(rule ?? ''));
+              return idx;
+            },
+            deleteRule() {},
+          };
+          return st;
+        }
         default: return new DomNode(tag.toUpperCase());
       }
     }
@@ -1670,7 +2344,11 @@ export function createBrowserHost(
         .find((n) => n.id === id) || null;
     }
     getElementsByTagName(name: string) {
-      return [...head.getElementsByTagName(name), ...body.getElementsByTagName(name)];
+      const upper = String(name || '').toUpperCase();
+      const out: DomNode[] = [];
+      if (upper === '*' || upper === 'HTML') out.push(htmlEl);
+      out.push(...htmlEl.getElementsByTagName(name));
+      return withItem(out);
     }
     createTextNode(text: string) {
       const n = new DomNode('#text');
@@ -1710,12 +2388,28 @@ export function createBrowserHost(
       };
       return ev;
     }
-    getElementsByClassName() { return []; }
-    getElementsByName() { return []; }
-    querySelector() { return null; }
-    querySelectorAll() { return []; }
+    getElementsByClassName() { return withItem([]); }
+    getElementsByName() { return withItem([]); }
+    querySelector(sel?: string) {
+      const s = String(sel || '').trim();
+      if (!s) return null;
+      if (s.startsWith('#')) return this.getElementById(s.slice(1));
+      const list = this.getElementsByTagName(s);
+      return list[0] ?? null;
+    }
+    querySelectorAll(sel?: string) {
+      const s = String(sel || '').trim();
+      if (!s) return withItem([]);
+      if (s.startsWith('#')) {
+        const el = this.getElementById(s.slice(1));
+        return withItem(el ? [el] : []);
+      }
+      return this.getElementsByTagName(s);
+    }
     hasFocus() { return true; }
   })();
+  htmlEl.appendChild(head);
+  htmlEl.appendChild(body);
   document.fonts.ready = Promise.resolve(document.fonts);
 
   // Resource fetch bridge for Image / Audio / plugins
@@ -1727,11 +2421,38 @@ export function createBrowserHost(
     return new Response(bytes, { status: 200 });
   };
 
-  // Multi-encoding TextDecoder wrapper: nx.js's built-in TextDecoder throws
-  // `TypeError: Only "utf-8" decoding is supported` on 'utf-16le', 'latin1', or uppercase 'UTF-8',
-  // which breaks Emscripten-compiled JS plugins (e.g. Live2D Cubism `enc_lv2d.js`).
+  // Fix nx.js's built-in TextEncoder.prototype.encode: upstream nx.js allocates only `1.5 * len` bytes
+  // and never grows the buffer, silently truncating any string with >50% non-ASCII code points (such as
+  // RPG Maker MZ's `pako.deflate(..., { to: 'string' })` .rmmzsave save files!). Patching prototype.encode
+  // in place also fixes nx.js's internal `Switch.writeFileSync` / `Switch.writeFile` encoder instance!
+  const NativeTextEncoder = (globalThis as any).TextEncoder;
+  if (NativeTextEncoder?.prototype && !NativeTextEncoder.prototype.__drFixedEncode) {
+    NativeTextEncoder.prototype.__drFixedEncode = true;
+    NativeTextEncoder.prototype.encode = function (input?: string): Uint8Array {
+      return encodeUtf8Safe(input ? String(input) : '');
+    };
+  }
+
+  // Multi-encoding & stack-safe TextDecoder wrapper:
+  // 1. nx.js's built-in TextDecoder throws `TypeError: Only "utf-8" decoding is supported` on 'utf-16le',
+  //    'latin1', or uppercase 'UTF-8' (breaking Live2D `enc_lv2d.js`, etc.).
+  // 2. nx.js's UTF-8 `TextDecoder.prototype.decode` passes 65,535 arguments to `String.fromCharCode.apply`
+  //    at once; replace it with 8192-unit chunking (`decodeUtf8Safe`) so large saves/JSONs never overflow stack.
   const NativeTextDecoder = (globalThis as any).TextDecoder;
   if (NativeTextDecoder && !NativeTextDecoder.__drWrapped) {
+    if (NativeTextDecoder.prototype) {
+      NativeTextDecoder.prototype.decode = function (input?: BufferSource): string {
+        if (!input) return '';
+        const bytes = input instanceof Uint8Array
+          ? input
+          : ArrayBuffer.isView(input)
+            ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+            : input instanceof ArrayBuffer
+              ? new Uint8Array(input)
+              : new Uint8Array(0);
+        return decodeUtf8Safe(bytes, !this.ignoreBOM);
+      };
+    }
     const toUint8 = (input?: BufferSource): Uint8Array => {
       if (!input) return new Uint8Array(0);
       if (input instanceof Uint8Array) return input;
@@ -1828,6 +2549,97 @@ export function createBrowserHost(
     (globalThis as any).Image = WrappedImage;
   }
 
+  // Wrap FontFace so CSS `url(...)` sources (e.g. Coffin's Font.change `url(blob:...)` / `url(fonts/...)`)
+  // and `face.load()` Promises work seamlessly on nx.js (whose native FontFace only accepts ArrayBuffer
+  // and throws `Method not implemented` on `.load()`).
+  const NativeFontFace = (globalThis as any).FontFace;
+  if (NativeFontFace && !NativeFontFace.__drWrapped) {
+    const WrappedFontFace = function (this: any, family: string, source: string | BufferSource, descriptors?: any) {
+      if (typeof source !== 'string') {
+        const face = new NativeFontFace(family, source, descriptors);
+        if (typeof face.load !== 'function' || !face.__drLoadPatched) {
+          face.__drLoadPatched = true;
+          try {
+            face.load = () => Promise.resolve(face);
+          } catch { /* ignore */ }
+        }
+        return face;
+      }
+      const urlMatch = /^\s*url\(\s*(?:"([^"]+)"|'([^']+)'|([^)]+))\s*\)/i.exec(source);
+      const rawUrl = (urlMatch?.[1] ?? urlMatch?.[2] ?? urlMatch?.[3] ?? source).trim();
+      let loadedPromise: Promise<any> | null = null;
+      const wrapper: any = {
+        family,
+        status: 'unloaded',
+        style: descriptors?.style ?? 'normal',
+        weight: descriptors?.weight ?? 'normal',
+        stretch: descriptors?.stretch ?? 'normal',
+        display: descriptors?.display ?? 'auto',
+        load() {
+          if (!loadedPromise) {
+            wrapper.status = 'loading';
+            loadedPromise = (async () => {
+              const res = await resourceFetch(rawUrl);
+              if (!res.ok) throw new Error(`Failed to fetch font: ${rawUrl} (${res.status})`);
+              const buf = await res.arrayBuffer();
+              const nativeFace = new NativeFontFace(family, buf, descriptors);
+              try { nativeFace.load = () => Promise.resolve(nativeFace); } catch { /* ignore */ }
+              wrapper.status = 'loaded';
+              return nativeFace;
+            })();
+          }
+          return loadedPromise;
+        },
+      };
+      Object.defineProperty(wrapper, 'loaded', {
+        configurable: true,
+        get: () => wrapper.load(),
+      });
+      return wrapper;
+    } as any;
+    WrappedFontFace.__drWrapped = true;
+    WrappedFontFace.prototype = NativeFontFace.prototype;
+    (globalThis as any).FontFace = WrappedFontFace;
+  }
+
+  // Provide standard browser Base64 helpers (`atob` / `btoa`) if absent in nx.js (required by Coffin's DRM check).
+  const B64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  if (typeof (globalThis as any).atob !== 'function') {
+    (globalThis as any).atob = (input: string): string => {
+      const clean = String(input ?? '').replace(/[\t\n\f\r ]+/g, '');
+      let out = '';
+      for (let i = 0; i < clean.length; i += 4) {
+        const a = B64_CHARS.indexOf(clean[i]);
+        const b = B64_CHARS.indexOf(clean[i + 1] ?? '=');
+        const cCh = clean[i + 2] ?? '=';
+        const dCh = clean[i + 3] ?? '=';
+        const c = cCh === '=' ? -1 : B64_CHARS.indexOf(cCh);
+        const d = dCh === '=' ? -1 : B64_CHARS.indexOf(dCh);
+        if (a < 0 || b < 0) break;
+        out += String.fromCharCode(((a << 2) | (b >> 4)) & 0xff);
+        if (c >= 0) out += String.fromCharCode((((b & 15) << 4) | (c >> 2)) & 0xff);
+        if (d >= 0) out += String.fromCharCode((((c & 3) << 6) | d) & 0xff);
+      }
+      return out;
+    };
+  }
+  if (typeof (globalThis as any).btoa !== 'function') {
+    (globalThis as any).btoa = (input: string): string => {
+      const str = String(input ?? '');
+      let out = '';
+      for (let i = 0; i < str.length; i += 3) {
+        const a = str.charCodeAt(i) & 0xff;
+        const b = i + 1 < str.length ? (str.charCodeAt(i + 1) & 0xff) : -1;
+        const c = i + 2 < str.length ? (str.charCodeAt(i + 2) & 0xff) : -1;
+        out += B64_CHARS[a >> 2];
+        out += B64_CHARS[((a & 3) << 4) | (b >= 0 ? b >> 4 : 0)];
+        out += b < 0 ? '=' : B64_CHARS[((b & 15) << 2) | (c >= 0 ? c >> 6 : 0)];
+        out += c < 0 ? '=' : B64_CHARS[c & 63];
+      }
+      return out;
+    };
+  }
+
   const g = globalThis as any;
   Object.assign(g, {
     window: g,
@@ -1876,8 +2688,24 @@ export function createBrowserHost(
       Object.defineProperty(g.navigator, 'language', { configurable: true, value: 'en-US' });
     } catch { /* ignore */ }
   }
+  if (!g.navigator.plugins) {
+    try {
+      Object.defineProperty(g.navigator, 'plugins', {
+        configurable: true,
+        value: { length: 0, item: () => null, namedItem: () => null },
+      });
+    } catch {
+      g.navigator.plugins = { length: 0, item: () => null, namedItem: () => null };
+    }
+  }
   for (const fn of ['moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'focus', 'blur', 'close', 'scrollTo']) {
     if (typeof g[fn] !== 'function') g[fn] = () => {};
+  }
+  if (typeof g.addEventListener !== 'function' && typeof EventTarget !== 'undefined') {
+    const winEvents = new EventTarget();
+    g.addEventListener = winEvents.addEventListener.bind(winEvents);
+    g.removeEventListener = winEvents.removeEventListener.bind(winEvents);
+    g.dispatchEvent = winEvents.dispatchEvent.bind(winEvents);
   }
   if (typeof g.open !== 'function') {
     g.open = (url?: string) => {
@@ -2113,9 +2941,6 @@ export function createBrowserHost(
         }
       }
     }
-    if (protos.length > 0) {
-      log('[audio] Shimmed BaseAudioContext.createPanner -> StereoPannerNode');
-    }
   };
   installAudioCompat();
 
@@ -2150,6 +2975,9 @@ export function createBrowserHost(
     markLetterboxDirty() { letterboxDirty = true; },
     forceStopVideos() {
       for (const v of Array.from(activeVideos)) v.forceFinish();
+    },
+    getSkippedScripts() {
+      return skippedScripts.slice();
     },
     beginFrame() {
       if (enableWebGL && webglCtx) {

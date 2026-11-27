@@ -11,6 +11,7 @@ cp -f "$PROJECT_DIR/upstream/nx.js/source/main.cc" "$NXJS_WORK/source/main.cc"
 cp -f "$PROJECT_DIR/upstream/nx.js/source/skia_gpu.cc" "$NXJS_WORK/source/skia_gpu.cc"
 cp -f "$PROJECT_DIR/upstream/nx.js/source/webgl.cc" "$NXJS_WORK/source/webgl.cc"
 cp -f "$PROJECT_DIR/upstream/nx.js/source/image.cc" "$NXJS_WORK/source/image.cc"
+cp -f "$PROJECT_DIR/upstream/nx.js/source/canvas.cc" "$NXJS_WORK/source/canvas.cc"
 
 cd "$NXJS_WORK"
 make -f Makefile.switch2 -j"$(nproc)" V=1

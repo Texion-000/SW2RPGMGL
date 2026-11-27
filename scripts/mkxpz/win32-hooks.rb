@@ -37,6 +37,206 @@ Win32API.prepend(SW2Win32Hooks) if defined?(Win32API)
 # are provided as Ruby emulations below.
 SW2Win32Hooks.add("RGSS Linker", "RGSSLinker_Initialize") { |_| 1 }
 
+# Steamworks C API (steam_api.dll / steam_api64.dll) & Freebird Games UtilsSteam.dll / Utils.dll:
+# Games like Finding Paradise check `SteamAPI_Init.call == 1` at startup and exit with a message box
+# if it returns 0, then poll UtilsSteam.dll for achievement state on every Graphics.update.
+module SW2SteamAchievements
+	@unlocked = nil
+
+	def self.store_path
+		base = ENV["APPDATA"] || File.join(Dir.pwd, "userdata")
+		File.join(base, "sw2_steam_achievements.txt")
+	end
+
+	def self.unlocked_set
+		if @unlocked.nil?
+			@unlocked = {}
+			begin
+				p = store_path
+				if File.file?(p)
+					File.readlines(p).each do |line|
+						k = line.to_s.strip
+						@unlocked[k] = true unless k.empty?
+					end
+				end
+			rescue StandardError
+			end
+		end
+		@unlocked
+	end
+
+	def self.unlocked?(api_name)
+		unlocked_set[api_name.to_s.strip] ? true : false
+	end
+
+	def self.unlock(api_name)
+		key = api_name.to_s.strip
+		return true if key.empty?
+		set = unlocked_set
+		unless set[key]
+			set[key] = true
+			begin
+				File.open(store_path, "ab") { |f| f.write("#{key}\n") }
+			rescue StandardError
+			end
+		end
+		true
+	end
+
+	def self.reset_all
+		@unlocked = {}
+		begin
+			p = store_path
+			File.delete(p) if File.file?(p)
+		rescue StandardError
+		end
+		true
+	end
+
+	def self.write_cstr(dst, text, max_len)
+		buf = defined?(resolve_win32_buffer) ? resolve_win32_buffer(dst) : dst
+		return 0 unless buf.respond_to?(:setbyte)
+		limit = max_len.to_i
+		limit = buf.bytesize if limit <= 0 && buf.respond_to?(:bytesize)
+		return 0 if limit <= 0
+		bytes = text.to_s.bytes[0, [limit - 1, 0].max] || []
+		bytes.each_with_index { |b, i| buf.setbyte(i, b) }
+		buf.setbyte(bytes.length, 0) if !buf.respond_to?(:bytesize) || bytes.length < buf.bytesize
+		1
+	rescue StandardError
+		0
+	end
+end
+
+%w[steam_api steam_api64].each do |dll|
+	%w[SteamAPI_Init SteamAPI_InitSafe SteamAPI_IsSteamRunning SteamAPI_GetHSteamUser SteamAPI_GetHSteamPipe].each do |fn|
+		SW2Win32Hooks.add(dll, fn) { |_| 1 }
+	end
+	%w[SteamAPI_RestartAppIfNecessary SteamAPI_Shutdown SteamAPI_RunCallbacks SteamAPI_RegisterCallback SteamAPI_UnregisterCallback SteamAPI_WriteMiniDump].each do |fn|
+		SW2Win32Hooks.add(dll, fn) { |_| 0 }
+	end
+end
+
+SW2Win32Hooks.add("UtilsSteam", "callbackReceived") { |_| 1 }
+SW2Win32Hooks.add("UtilsSteam", "getAchievementStatus") { |args| SW2SteamAchievements.unlocked?(args[0]) ? 1 : 0 }
+SW2Win32Hooks.add("UtilsSteam", "setAchievement") { |args| SW2SteamAchievements.unlock(args[0]); 1 }
+SW2Win32Hooks.add("UtilsSteam", "getAchievementName") { |args| SW2SteamAchievements.write_cstr(args[1], args[0].to_s, args[2] || 256) }
+SW2Win32Hooks.add("UtilsSteam", "getAchievementDesc") { |args| SW2SteamAchievements.write_cstr(args[1], "", args[2] || 256) }
+SW2Win32Hooks.add("UtilsSteam", "testResetAllStats") { |_| SW2SteamAchievements.reset_all; 1 }
+
+SW2Win32Hooks.add("Utils", "IsFullScreen") { |_| 1 }
+%w[ShellExecute ShellExecuteA ShellExecuteW].each do |fn|
+	SW2Win32Hooks.add("shell32", fn) { |_| 33 }
+end
+
+# Switch 2 touch/controller cursor coordination for Win32 GetCursorPos:
+# Games with custom mouse scripts (Finding Paradise, To the Moon, SephirothSpawn Mouse) poll GetCursorPos
+# every frame and force Window_Selectable#@index to whatever item the cursor sits over. On Switch, SDL's
+# initial (0, 0) or last touchscreen tap coordinate would otherwise park a cursor on screen and fight D-Pad
+# menu navigation. Keep the virtual cursor off-window (-100, -100) until touch actually moves/presses, and
+# re-park it as soon as any Joy-Con / Pro Controller button or stick is used.
+if defined?(Win32API_Impl::User32::GetCursorPos)
+	class Win32API_Impl::User32::GetCursorPos
+		AXIS_DEADZONE = 0x4000
+
+		def initialize
+			@last_mx = (Input.mouse_x rescue 0)
+			@last_my = (Input.mouse_y rescue 0)
+			@touch_active = false
+		end
+
+		def controller_used?
+			if defined?(Input::Controller)
+				btns = (Input::Controller.raw_button_states rescue nil)
+				return true if btns && btns.any? { |b| b }
+				axes = (Input::Controller.raw_axes rescue nil)
+				if axes
+					return true if axes[0].to_i.abs > AXIS_DEADZONE || axes[1].to_i.abs > AXIS_DEADZONE ||
+					               axes[2].to_i.abs > AXIS_DEADZONE || axes[3].to_i.abs > AXIS_DEADZONE ||
+					               axes[4].to_i > AXIS_DEADZONE || axes[5].to_i > AXIS_DEADZONE
+				end
+			end
+			false
+		end
+
+		def call(args)
+			pump_mkxp_raw_input_once_per_frame if defined?(pump_mkxp_raw_input_once_per_frame)
+			mx = (Input.mouse_x rescue 0)
+			my = (Input.mouse_y rescue 0)
+			m_down = if Input.respond_to?(:__mkxp_raw_press?) && defined?(Input::MKXP_MOUSELEFT)
+				Input.__mkxp_raw_press?(Input::MKXP_MOUSELEFT)
+			else
+				(Input.press?(Input::MOUSELEFT) rescue false)
+			end
+			if m_down || mx != @last_mx || my != @last_my
+				@last_mx = mx
+				@last_my = my
+				@touch_active = true if m_down || mx != 0 || my != 0
+			elsif @touch_active && controller_used?
+				@touch_active = false
+			end
+			out = (@touch_active ? [mx, my] : [-100, -100]).pack("ll")
+			memcpy_string(args[0], out)
+			1
+		end
+	end
+end
+
+# Poccil's WASD MODULE (used by To the Moon & Finding Paradise) replaces Input and maps W/A/S/D
+# (0x57/0x41/0x53/0x44) to UP/LEFT/DOWN/RIGHT, which collides with SwitchControls' default key bindings
+# for X (LShift+D), R (D+PageDown), ZR (W), and Right Stick (A/S). Keep Arrow keys (D-Pad & Left Stick)
+# for directions and PageDown (0x22) for Input::R so controller buttons never cause unintended movement.
+if defined?(Input)
+	class << Input
+		alias_method :__sw2_wasd_singleton_method_added, :singleton_method_added
+		def singleton_method_added(m)
+			__sw2_wasd_singleton_method_added(m)
+			return if m != :buttonToKey || @sw2_patching_wasd
+			@sw2_patching_wasd = true
+			begin
+				orig = method(:buttonToKey)
+				define_singleton_method(:buttonToKey) do |button|
+					keys = orig.call(button)
+					return keys unless keys.is_a?(Array)
+					case button
+					when 2 then keys.include?(0x28) ? [0x28] : keys # DOWN: Down arrow
+					when 4 then keys.include?(0x25) ? [0x25] : keys # LEFT: Left arrow
+					when 6 then keys.include?(0x27) ? [0x27] : keys # RIGHT: Right arrow
+					when 8 then keys.include?(0x26) ? [0x26] : keys # UP: Up arrow
+					when 18 then keys.include?(0x22) ? (keys - [0x57]) : keys # R: PageDown without W
+					else keys
+					end
+				end
+				System.puts("[input] Adapted WASD MODULE buttonToKey for Switch controller") rescue nil
+			ensure
+				@sw2_patching_wasd = false
+			end
+		end
+	end
+end
+
+# Track Graphics.freeze / Graphics.transition state in Ruby (RGSS / mkxp-z has no Graphics.frozen? getter),
+# so SW2Loading and SW2MsgBox can always unfreeze before presenting an overlay.
+if defined?(Graphics)
+	class << Graphics
+		unless method_defined?(:sw2_frozen?)
+			alias_method :__sw2_orig_freeze, :freeze
+			alias_method :__sw2_orig_transition, :transition
+			def freeze(*args)
+				@sw2_frozen = true
+				__sw2_orig_freeze(*args)
+			end
+			def transition(*args)
+				@sw2_frozen = false
+				__sw2_orig_transition(*args)
+			end
+			def sw2_frozen?
+				@sw2_frozen ? true : false
+			end
+		end
+	end
+end
+
 # RGSS FmodEx (Nuri Yuri): FMOD-based Audio replacement used by Pokemon Essentials games such as
 # Pokemon Uranium. Emulate ::FmodEx on top of mkxp-z's own Audio module (captured before the game's
 # script replaces the Audio functions with FmodEx-backed ones).
@@ -94,6 +294,28 @@ module SW2MsgBox
 		out
 	end
 
+	# The + button by itself: through Input it shares Y's keyboard keys (Escape / F6)
+	def self.plus_pressed?
+		defined?(Input::Controller) && Input::Controller.pressex?(:START)
+	rescue StandardError
+		false
+	end
+
+	def self.ok_or_cancel_triggered?
+		if defined?(SwitchControls) && SwitchControls.respond_to?(:raw_trigger?)
+			return true if SwitchControls.raw_trigger?(:C, Input::C) || SwitchControls.raw_trigger?(:B, Input::B)
+		end
+		(Input.trigger?(Input::C) || Input.trigger?(Input::B)) rescue false
+	end
+
+	def self.pump_input
+		if defined?(SwitchControls) && SwitchControls.respond_to?(:raw_update)
+			SwitchControls.raw_update
+		else
+			Input.update rescue nil
+		end
+	end
+
 	def self.show(text)
 		text = text.to_s
 		begin
@@ -105,9 +327,10 @@ module SW2MsgBox
 		@showing = true
 		vp = spr = bmp = nil
 		begin
+			SW2Loading.finish if defined?(SW2Loading) && SW2Loading.respond_to?(:finish)
 			w = (Graphics.width rescue 640).to_i
 			h = (Graphics.height rescue 480).to_i
-			Graphics.transition(0) if Graphics.respond_to?(:frozen?) && Graphics.frozen?
+			Graphics.transition(0) if (Graphics.respond_to?(:sw2_frozen?) && Graphics.sw2_frozen?) || (Graphics.respond_to?(:frozen?) && Graphics.frozen?)
 			vp = Viewport.new(0, 0, w, h)
 			vp.z = 0x7ffffff0
 			spr = Sprite.new(vp)
@@ -120,14 +343,18 @@ module SW2MsgBox
 			max = [(h - 70) / 20, 1].max
 			lines = lines[0, max - 1] + ["..."] if lines.length > max
 			lines.each_with_index { |l, i| bmp.draw_text(20, 16 + i * 20, w - 40, 20, l) }
-			bmp.draw_text(0, h - 34, w, 24, "A / B: OK", 1)
+			bmp.draw_text(0, h - 34, w, 24, "A / B: OK      + : Return to Game Select", 1)
 			spr.bitmap = bmp
 			# wait for release, then a fresh press
-			5.times { Graphics.update; Input.update }
+			5.times { Graphics.update; pump_input }
 			loop do
 				Graphics.update
-				Input.update
-				break if Input.trigger?(Input::C) || Input.trigger?(Input::B)
+				pump_input
+				break if ok_or_cancel_triggered?
+				if plus_pressed?
+					System.puts("[msgbox] + pressed: returning to Game Select") rescue nil
+					Kernel.exit(0) # same as the Quick Menu's "Return to Game Select"
+				end
 			end
 		rescue StandardError, NotImplementedError
 		ensure
@@ -237,6 +464,49 @@ module SW2QuickMenuTrace
 	end
 end
 SW2_QUICKMENU_TRACE.enable
+
+# --- MGC H-Mode7 (Pokemon Insurgence): Mode 7 maps are drawn by a native library (libhmode7 / hmode7.dll)
+#     that can't be loaded on Switch, so HM7::Tilemap.new raises "H-Mode7 library ... is not available" when
+#     entering a map tagged [HM7] (e.g. right after New Game). Without the library, report Mode 7 as off:
+#     the game's own scripts then build the normal flat Tilemap for those maps.
+module SW2Hm7Fallback
+	def hm7
+		v = super
+		return v unless v
+		return v unless defined?(::HM7) && ::HM7.respond_to?(:available?)
+		return v if (::HM7.available? rescue false)
+		unless $sw2_hm7_fallback_logged
+			$sw2_hm7_fallback_logged = true
+			System.puts("[hm7] H-Mode7 native library unavailable -> drawing Mode 7 maps as normal flat maps") rescue nil
+		end
+		false
+	end
+end
+SW2_HM7_TRACE = TracePoint.new(:end) do |tp|
+	m = tp.self
+	next unless m.is_a?(Class) && SW2_MODULE_NAME.bind_call(m) == "Game_System"
+	next unless m.method_defined?(:hm7)
+	next if m.ancestors.include?(SW2Hm7Fallback)
+	m.prepend(SW2Hm7Fallback)
+end
+SW2_HM7_TRACE.enable
+
+# --- Games with their own SDL controller layer (Pokemon Insurgence's Input::Pad reads
+#     Input::Controller.raw_button_states with an Xbox layout): SwitchControls already maps the Switch
+#     controller to keyboard keys, and SDL's positional Switch mapping reports the physical A button as
+#     SDL "B". One press of A then counted as confirm (Enter) AND cancel (Pad B), so every Yes/No prompt
+#     answered "No" (endless "Traditional or Dark Story?" loop). Mute the game's raw pad reader.
+SW2_PAD_TRACE = TracePoint.new(:end) do |tp|
+	m = tp.self
+	next unless m.is_a?(Module) && SW2_MODULE_NAME.bind_call(m) == "Input::Pad"
+	next unless m.respond_to?(:read_controller)
+	next if m.instance_variable_get(:@sw2_pad_muted)
+	m.instance_variable_set(:@sw2_pad_muted, true)
+	count = m.const_defined?(:COUNT, false) ? m.const_get(:COUNT, false) : 32
+	m.define_singleton_method(:read_controller) { Array.new(count, false) }
+	System.puts("[input] Muted game's own Input::Pad controller reader (Switch controller handled via SwitchControls)") rescue nil
+end
+SW2_PAD_TRACE.enable
 
 # --- Audio API from newer mkxp-z forks (Pokemon Reborn): positional SE falls back to plain se_play,
 #     bgm_position is the older name of bgm_pos.

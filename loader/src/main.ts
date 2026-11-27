@@ -7,7 +7,17 @@ import { createBrowserHost, installFontLeakGuard } from './browser-host';
 import { runGameSelect } from './game-select';
 import { discoverGames, engineFullLabel, findMkxpzNroPath, inspectSingleMvGame, type GameEntry } from './games';
 import { createInputBridge } from './input';
-import { getLogPath, getSwitch, initLog, log, recentLogs, resolveLaunchArgs } from './log';
+import {
+  SW2RPGMGL_VERSION,
+  getLogPath,
+  getSwitch,
+  initLog,
+  log,
+  logGameDiagnostics,
+  logRuntimeDiagnostics,
+  recentLogs,
+  resolveLaunchArgs,
+} from './log';
 import {
   createScriptPreparer,
   detectAudioSupport,
@@ -15,6 +25,7 @@ import {
   extractIndexScripts,
   installMvCompat,
   mountIndexHtmlCanvases,
+  registerFontFamilySync,
   registerGameFonts,
 } from './mv-compat';
 import { installNodeCompat } from './node-compat';
@@ -47,7 +58,9 @@ function detectMvNeedsWebGL(sw: NonNullable<ReturnType<typeof getSwitch>>, game:
     const pixiReason = detectMvWebGLReason(null, null, pixiHead);
     if (pixiReason) return pixiReason;
     const rpgCoreText = readText('js/rpg_core.js');
-    return detectMvWebGLReason(null, rpgCoreText, null);
+    const coreReason = detectMvWebGLReason(null, rpgCoreText, null);
+    if (coreReason) return coreReason;
+    return detectMvWebGLReason(null, null, null, readText('js/rpg_managers.js'));
   } catch {
     return null;
   }
@@ -77,7 +90,7 @@ function drawSplash(
 
   ctx.fillStyle = isError ? '#d96b7c' : '#6c8cff';
   ctx.font = '20px sans-serif';
-  ctx.fillText('SW2RPGMGL  •  kaiHEN / OunceVK Skia GPU', 72, 130);
+  ctx.fillText(`SW2RPGMGL v${SW2RPGMGL_VERSION}  •  RPG Maker MV (kaiHEN / OunceVK Skia GPU)`, 72, 130);
 
   // Progress bar
   const barX = 72;
@@ -112,6 +125,31 @@ function drawSplash(
     sh - 54,
   );
   ctx.restore();
+}
+
+/**
+ * Games whose `www/data/` folder is completely missing or empty (e.g. a single-file Enigma Virtual Box
+ * `.exe` whose `www/data/` was never unpacked) hang on a black screen after Scene_Boot because stock
+ * RPG Maker MV never reports a missing `data/System.json`. Catch empty `www/data/` up front, while
+ * allowing games with plugin-decrypted containers (e.g. OMORI `.KEL`/`.PLUTO` and The Coffin of Andy
+ * and Leyley `TCOAAL` hashed files) to boot through their JS decryption layers.
+ */
+function detectUnreadableGameData(
+  assets: ReturnType<typeof createAssetReader>,
+): { title: string; detail: string; log: string } | null {
+  if (assets.exists('data/System.json')) return null;
+  let names: string[] = [];
+  try {
+    names = assets.readDirSync('data');
+  } catch { /* missing folder */ }
+  if (names.length === 0) {
+    return {
+      title: 'Game data not found',
+      detail: 'www/data/ is missing or empty. If the game shipped as a single .exe, unpack it on a PC first.',
+      log: 'www/data has no files; not starting the game',
+    };
+  }
+  return null;
 }
 
 let fatalActive = false;
@@ -168,12 +206,13 @@ async function launchGame(
 ): Promise<void> {
   const enableWebGL = Boolean(webglReason);
   const title = game.title;
-  log(`=== Launching Game: "${title}"${enableWebGL ? ` [WebGL2/${webglReason} mode]` : ''} ===`);
-  log(`  gameDir: ${game.gameDir}`);
-  log(`  wwwRoot: ${game.wwwRoot}`);
-  log(`  saveDir: ${game.saveDir}`);
-
   const assets = createAssetReader(game.wwwRoot, sw);
+  logGameDiagnostics(sw, game, assets, {
+    rendererMode: enableWebGL ? `Hardware WebGL2 (OunceVK ES3, reason: ${webglReason})` : 'Canvas2D (Skia GPU)',
+    displayMode: game.config.displayMode ?? 'fit',
+    filterMode: game.config.filterMode ?? 'auto',
+  });
+
   const scriptPreparer = createScriptPreparer(game.config.skipPlugins);
   const host = createBrowserHost(assets, scriptPreparer, screen, {
     gameTitle: title,
@@ -209,7 +248,7 @@ async function launchGame(
     const gl = host.ensureWebGLContext();
     glSplash = createWebGLSplash(
       gl,
-      `SW2RPGMGL  •  RPG Maker MV (WebGL2 / ${webglReason})`,
+      `SW2RPGMGL v${SW2RPGMGL_VERSION}  •  RPG Maker MV (WebGL2 / ${webglReason})`,
       '#6c8cff',
     );
   }
@@ -228,7 +267,7 @@ async function launchGame(
       const errGl = host.getWebGLContext();
       const errSplash = glSplash || createWebGLSplash(
         errGl,
-        'SW2RPGMGL  •  RPG Maker MV (WebGL2 / Live2D)',
+        `SW2RPGMGL v${SW2RPGMGL_VERSION}  •  RPG Maker MV (WebGL2 / ${webglReason})`,
         '#6c8cff',
       );
       const tail = recentLogs().slice(-6).join('\n');
@@ -271,6 +310,12 @@ async function launchGame(
     showFatal('Missing www/index.html', `Expected ${game.wwwRoot}/index.html`);
     return;
   }
+  const packed = detectUnreadableGameData(assets);
+  if (packed) {
+    log(`[data] ${packed.log}`);
+    showFatal(packed.title, packed.detail);
+    return;
+  }
   const indexHtml = new TextDecoder().decode(indexBytes);
   const scripts = extractIndexScripts(indexHtml);
   const extraCanvases = mountIndexHtmlCanvases((globalThis as any).document, indexHtml);
@@ -300,6 +345,15 @@ async function launchGame(
     const pct = 0.25 + (0.58 * (i + 1)) / Math.max(1, scripts.length);
     await updateSplash(pct, `Loading engine scripts (${i + 1}/${scripts.length})…`, scriptPath);
     await host.loadScript(scriptPath);
+    // As soon as rpg_core.js defines Graphics (before any plugin runs), make Graphics.loadFont register the
+    // game's font under the requested family name (the stock version injects a CSS @font-face rule).
+    const G = (globalThis as any).Graphics;
+    if (G && typeof G.loadFont === 'function' && !G.__drLoadFontPatched) {
+      G.__drLoadFontPatched = true;
+      G.loadFont = (name: string, url: string) => {
+        registerFontFamilySync(name, url);
+      };
+    }
   }
 
   // Wait for PluginManager.setup($plugins) to finish loading all enabled plugins
@@ -311,10 +365,12 @@ async function launchGame(
 
   await updateSplash(0.94, 'Installing Switch 2 saves, controls & GPU acceleration…');
   const runtime = globalThis as any;
+  logRuntimeDiagnostics(runtime, { skippedScripts: host.getSkippedScripts?.() });
   const input = createInputBridge();
   installMvCompat(runtime, host, {
     audioSupport,
     fastMenu: game.config.fastMenu !== false,
+    live2dUpdateRate: game.config.live2dUpdateRate ?? 'auto',
     onFatalError: (errTitle, errDetail) => {
       showFatal(errTitle, errDetail);
     },
@@ -372,14 +428,10 @@ async function launchGame(
 }
 
 async function boot(): Promise<void> {
-  initLog();
+  initLog('mv.log', 'RPG Maker MV Engine');
   const sw = getSwitch();
   const { loaderDir, directGameDir, returnNroPath } = resolveLaunchArgs(sw?.argv);
   activeReturnNro = returnNroPath;
-  log(
-    `Booting SW2RPGMGL — MV Engine (screen=${screen?.width}x${screen?.height}, dir=${loaderDir}` +
-    `${directGameDir ? `, directGame=${directGameDir}` : ''}${returnNroPath ? `, returnNro=${returnNroPath}` : ''})`,
-  );
 
   // Allow Plus (+) to exit cleanly while in Game Select or Fatal Error mode;
   // prevent accidental Plus (+) quits once a game is running (use Minus -> Exit instead).

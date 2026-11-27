@@ -19,7 +19,7 @@
 import type { DisplayMode, FilterMode } from './browser-host';
 import { ensureDir, log, type SwitchApi } from './log';
 
-export type GameEngine = 'mv' | 'mz' | 'vxace' | 'vx' | 'xp';
+export type GameEngine = 'mv' | 'mz' | 'vxace' | 'vx' | 'xp' | 'wolf';
 
 export interface GameConfig {
   title?: string;
@@ -29,6 +29,8 @@ export interface GameConfig {
   filterMode?: FilterMode;
   /** MV: reuse map data + Spriteset_Map across pause-menu round-trips (default true). */
   fastMenu?: boolean;
+  /** MV Live2D: Cubism Core mesh update rate — 'auto' (halve when it is slow, default), 'half', 'full'. */
+  live2dUpdateRate?: 'auto' | 'half' | 'full';
 }
 
 export interface GameEntry {
@@ -185,6 +187,25 @@ function countRgssSaveFiles(
   return count;
 }
 
+function countWolfSaveFiles(
+  sw: Pick<SwitchApi, 'readDirSync'>,
+  gameDir: string,
+): number {
+  let count = 0;
+  for (const dir of [`${gameDir}/Save`, `${gameDir}/save`]) {
+    try {
+      const entries = sw.readDirSync(`${dir.replace(/\/+$/, '')}/`) ?? [];
+      for (const name of entries) {
+        const low = name.toLowerCase();
+        if (low.endsWith('.sav') && low !== 'syssavedata.sav') {
+          count++;
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  return count;
+}
+
 function parseGameConfig(
   sw: Pick<SwitchApi, 'readFileSync'>,
   gameDir: string,
@@ -218,6 +239,9 @@ function parseGameConfig(
     }
     if (typeof parsed.fastMenu === 'boolean') {
       cfg.fastMenu = parsed.fastMenu;
+    }
+    if (parsed.live2dUpdateRate === 'auto' || parsed.live2dUpdateRate === 'half' || parsed.live2dUpdateRate === 'full') {
+      cfg.live2dUpdateRate = parsed.live2dUpdateRate;
     }
     return cfg;
   } catch (err) {
@@ -284,9 +308,9 @@ function inspectMvGame(
 
 function isValidRgssIni(text: string | null): boolean {
   if (!text) return false;
-  // WOLF RPG Editor (e.g. False Myth) also uses Game.ini with SoftModeFlag/Old_DirectX_Use
-  // and Data/*.wolf archives; require actual RPG Maker RGSS INI markers.
-  return /(?:^\s*\[Game\]\s*$|^\s*Scripts\s*=|^\s*Library\s*=\s*.*RGSS|^\s*RTP\d*\s*=)/im.test(text);
+  // WOLF RPG Editor also uses [Game] in Game.ini (with SoftModeFlag/Old_DirectX_Use);
+  // require actual RPG Maker RGSS INI markers (Scripts=, Library=*RGSS*, or RTP=).
+  return /(?:^\s*Scripts\s*=|^\s*Library\s*=\s*.*RGSS|^\s*RTP\d*\s*=)/im.test(text);
 }
 
 function findRgssDescriptor(
@@ -441,6 +465,21 @@ export function findMkxpzNroPath(
   return null;
 }
 
+export function findWolfNroPath(
+  sw: Pick<SwitchApi, 'statSync'>,
+  loaderDir: string,
+): string | null {
+  const cleanRoot = loaderDir.replace(/\/+$/, '');
+  const candidates = [
+    `${cleanRoot}/engines/wolf-engine-switch2.nro`,
+    `${cleanRoot}/wolf-engine-switch2.nro`,
+  ];
+  for (const c of candidates) {
+    if (fileExistsSync(sw, c)) return c;
+  }
+  return null;
+}
+
 export function engineBadgeLabel(engine: GameEngine): string {
   switch (engine) {
     case 'mv': return 'MV';
@@ -448,6 +487,7 @@ export function engineBadgeLabel(engine: GameEngine): string {
     case 'vxace': return 'VX ACE';
     case 'vx': return 'VX';
     case 'xp': return 'XP';
+    case 'wolf': return 'WOLF';
   }
 }
 
@@ -458,6 +498,7 @@ export function engineFullLabel(engine: GameEngine): string {
     case 'vxace': return 'RPG Maker VX Ace (mkxp-z)';
     case 'vx': return 'RPG Maker VX (mkxp-z)';
     case 'xp': return 'RPG Maker XP (mkxp-z)';
+    case 'wolf': return 'WOLF RPG Editor (Woditor ARM64)';
   }
 }
 
@@ -498,6 +539,44 @@ function tryInspectFolder(
   const rgss = findRgssDescriptor(sw, gameDir);
   if (rgss.iniPath || rgss.hasRgssAssets) {
     return inspectRgssGame(sw, id, folderName, gameDir, rgss.iniPath);
+  }
+
+  // 4. WOLF RPG Editor layout: Data.wolf, Data/*.wolf, or Data/BasicData/Game.dat
+  let hasWolfArchive = fileExistsSync(sw, `${gameDir}/Data.wolf`) || fileExistsSync(sw, `${gameDir}/Data.dxa`);
+  if (!hasWolfArchive) {
+    try {
+      for (const name of sw.readDirSync(`${gameDir}/`) ?? []) {
+        if (/\.(?:wolf|dxa)$/i.test(name)) { hasWolfArchive = true; break; }
+      }
+    } catch { /* ignore */ }
+  }
+  if (!hasWolfArchive) {
+    try {
+      for (const name of sw.readDirSync(`${gameDir}/Data/`) ?? []) {
+        if (/\.(?:wolf|dxa)$/i.test(name)) { hasWolfArchive = true; break; }
+      }
+    } catch { /* ignore */ }
+  }
+  const hasWolfBasicData =
+    fileExistsSync(sw, `${gameDir}/Data/BasicData/Game.dat`) ||
+    fileExistsSync(sw, `${gameDir}/Data/BasicData/SysDatabase.dat`);
+  if (hasWolfArchive || hasWolfBasicData) {
+    const config = parseGameConfig(sw, gameDir);
+    return {
+      id,
+      folderName,
+      engine: 'wolf',
+      title: config.title || folderName,
+      gameDir,
+      wwwRoot: gameDir,
+      saveDir: `${gameDir}/Save`,
+      iconPath: findRgssIconPath(sw, gameDir),
+      pluginCount: 0,
+      saveCount: countWolfSaveFiles(sw, gameDir),
+      locale: '',
+      encrypted: hasWolfArchive,
+      config,
+    };
   }
 
   return null;

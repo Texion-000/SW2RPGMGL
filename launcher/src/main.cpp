@@ -32,6 +32,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifndef SW2RPGMGL_VERSION
+#define SW2RPGMGL_VERSION "0.3.2"
+#endif
+
 namespace {
 
 constexpr int SCREEN_W = 1280;
@@ -786,7 +790,7 @@ ImageRGBA loadGameIconRaw(const std::string& path) {
 // ============================================================================
 // Game Discovery & Metadata (Exact Parity with loader/src/games.ts)
 // ============================================================================
-enum class GameEngine { MV, MZ, VXAce, VX, XP };
+enum class GameEngine { MV, MZ, VXAce, VX, XP, Wolf };
 
 struct GameEntry {
     std::string id;
@@ -819,6 +823,7 @@ const char* engineBadgeLabel(GameEngine e) {
         case GameEngine::VXAce: return "VX ACE";
         case GameEngine::VX: return "VX";
         case GameEngine::XP: return "XP";
+        case GameEngine::Wolf: return "WOLF";
     }
     return "MV";
 }
@@ -830,6 +835,7 @@ const char* engineFullLabel(GameEngine e) {
         case GameEngine::VXAce: return "RPG Maker VX Ace (mkxp-z)";
         case GameEngine::VX: return "RPG Maker VX (mkxp-z)";
         case GameEngine::XP: return "RPG Maker XP (mkxp-z)";
+        case GameEngine::Wolf: return "WOLF RPG Editor (Woditor ARM64)";
     }
     return "RPG Maker MV";
 }
@@ -841,6 +847,7 @@ std::pair<Color, Color> engineBadgeColor(GameEngine e) {
         case GameEngine::VXAce: return {hexColor(0x4b2459), hexColor(0xf0b5ff)};
         case GameEngine::VX:    return {hexColor(0x244c59), hexColor(0x9eeaff)};
         case GameEngine::XP:    return {hexColor(0x28543a), hexColor(0x9ef5be)};
+        case GameEngine::Wolf:  return {hexColor(0x4a3319), hexColor(0xffcf87)};
     }
     return {hexColor(0x23386b), hexColor(0x9ec5ff)};
 }
@@ -937,6 +944,20 @@ int countRgssSaves(const std::string& gameDir) {
             std::string l = toLower(name);
             if (startsWithIgnoreCase(l, "save") &&
                 (endsWithIgnoreCase(l, ".rvdata2") || endsWithIgnoreCase(l, ".rvdata") || endsWithIgnoreCase(l, ".rxdata"))) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+int countWolfSaves(const std::string& gameDir) {
+    int count = 0;
+    std::string dirs[2] = {gameDir + "/Save", gameDir + "/save"};
+    for (const auto& d : dirs) {
+        for (const auto& name : listDirNames(d)) {
+            std::string l = toLower(name);
+            if (endsWithIgnoreCase(l, ".sav") && l != "syssavedata.sav") {
                 count++;
             }
         }
@@ -1112,6 +1133,47 @@ bool tryInspectFolder(const std::string& id, const std::string& folderName,
         out = std::move(g);
         return true;
     }
+
+    // 4. WOLF RPG Editor: Data.wolf, Data/*.wolf, or Data/BasicData/Game.dat
+    bool hasWolfArchive = false;
+    bool hasWolfExe = false;
+    for (const auto& name : entries) {
+        std::string l = toLower(name);
+        if (l == "data.wolf" || l == "data.dxa") hasWolfArchive = true;
+        else if (endsWithIgnoreCase(l, ".wolf")) hasWolfArchive = true;
+        if (l == "game.exe" || l == "gamepro.exe" || l == "config.exe") hasWolfExe = true;
+    }
+    if (!hasWolfArchive && isDir(gameDir + "/Data")) {
+        for (const auto& name : listDirNames(gameDir + "/Data")) {
+            std::string l = toLower(name);
+            if (endsWithIgnoreCase(l, ".wolf") || endsWithIgnoreCase(l, ".dxa")) {
+                hasWolfArchive = true;
+                break;
+            }
+        }
+    }
+    bool hasWolfBasicData = isRegularFile(gameDir + "/Data/BasicData/Game.dat") ||
+                            isRegularFile(gameDir + "/Data/BasicData/SysDatabase.dat") ||
+                            isRegularFile(gameDir + "/data/basicdata/game.dat");
+    if (hasWolfArchive || hasWolfBasicData) {
+        (void)hasWolfExe;
+        GameEntry g;
+        g.id = id;
+        g.folderName = folderName;
+        g.engine = GameEngine::Wolf;
+        g.gameDir = gameDir;
+        g.wwwRoot = gameDir;
+        g.saveDir = gameDir + "/Save";
+
+        std::string cfgText = readTextFile(gameDir + "/mv-loader.json", 32 * 1024);
+        std::string cfgTitle = cfgText.empty() ? "" : extractJsonStringField(cfgText, "title");
+        g.title = !cfgTitle.empty() ? cfgTitle : folderName;
+        g.encrypted = hasWolfArchive;
+        g.saveCount = countWolfSaves(gameDir);
+        g.iconPath = findRgssIconPath(gameDir);
+        out = std::move(g);
+        return true;
+    }
     return false;
 }
 
@@ -1204,6 +1266,17 @@ std::string findMkxpzEngineNro(const std::string& launcherDir) {
     return {};
 }
 
+std::string findWolfEngineNro(const std::string& launcherDir) {
+    std::vector<std::string> cands = {
+        launcherDir + "/engines/wolf-engine-switch2.nro",
+        launcherDir + "/wolf-engine-switch2.nro",
+    };
+    for (const auto& c : cands) {
+        if (isRegularFile(c)) return c;
+    }
+    return {};
+}
+
 std::string loadLastSelectedGameId(const std::string& launcherDir) {
     std::string text = readTextFile(launcherDir + "/loader-state.json", 4096);
     if (text.empty()) return {};
@@ -1254,7 +1327,7 @@ int main(int argc, char* argv[]) {
     std::string logDir = launcherDir + "/log";
     mkdir(logDir.c_str(), 0777);
     g_logFile = fopen((logDir + "/launcher.log").c_str(), "wb");
-    logMsg("=== SW2RPGMGL (Native libounce UI) ===");
+    logMsg("=== SW2RPGMGL v" SW2RPGMGL_VERSION " (Native libounce UI — launcher.log) ===");
     logMsg("selfNro: %s", selfNro.c_str());
     logMsg("launcherDir: %s", launcherDir.c_str());
 
@@ -1298,9 +1371,11 @@ int main(int argc, char* argv[]) {
     std::string mvEnginePath = findMvEngineNro(launcherDir);
     std::string mzEnginePath = findMzEngineNro(launcherDir);
     std::string mkxpzEnginePath = findMkxpzEngineNro(launcherDir);
+    std::string wolfEnginePath = findWolfEngineNro(launcherDir);
     logMsg("[engines] mv=%s", mvEnginePath.empty() ? "(missing)" : mvEnginePath.c_str());
     logMsg("[engines] mz=%s", mzEnginePath.empty() ? "(missing)" : mzEnginePath.c_str());
     logMsg("[engines] mkxpz=%s", mkxpzEnginePath.empty() ? "(missing)" : mkxpzEnginePath.c_str());
+    logMsg("[engines] wolf=%s", wolfEnginePath.empty() ? "(missing)" : wolfEnginePath.c_str());
 
     int selected = 0;
     int scrollTop = 0;
@@ -1370,6 +1445,17 @@ int main(int argc, char* argv[]) {
                            g.gameDir + "\" \"" + selfNro + "\"";
             shouldLaunch = true;
             logMsg("[launch] MZ '%s' -> %s", g.title.c_str(), nextLoadArgs.c_str());
+        } else if (g.engine == GameEngine::Wolf) {
+            wolfEnginePath = findWolfEngineNro(launcherDir);
+            if (wolfEnginePath.empty()) {
+                showToast("Missing engines/wolf-engine-switch2.nro!", 4000.0);
+                logMsg("[launch] ERROR: wolf-engine-switch2.nro not found");
+                return;
+            }
+            nextLoadPath = wolfEnginePath;
+            nextLoadArgs = "\"" + wolfEnginePath + "\" \"" + g.gameDir + "\" \"" + selfNro + "\"";
+            shouldLaunch = true;
+            logMsg("[launch] WOLF '%s' -> %s", g.title.c_str(), nextLoadArgs.c_str());
         } else {
             mkxpzEnginePath = findMkxpzEngineNro(launcherDir);
             if (mkxpzEnginePath.empty()) {
@@ -1390,6 +1476,7 @@ int main(int argc, char* argv[]) {
         mvEnginePath = findMvEngineNro(launcherDir);
         mzEnginePath = findMzEngineNro(launcherDir);
         mkxpzEnginePath = findMkxpzEngineNro(launcherDir);
+        wolfEnginePath = findWolfEngineNro(launcherDir);
         selected = 0;
         scrollTop = 0;
         if (!prevId.empty()) {
@@ -1607,8 +1694,8 @@ int main(int argc, char* argv[]) {
         canvas.fillRect(0, 0, SCREEN_W, headerH, hexColor(0x141926));
         canvas.fillRect(0, headerH - 2, SCREEN_W, 2, hexColor(0x5c7cfa));
 
-        font.drawText(canvas, "SW2RPGMGL", padX, 18, 28, hexColor(0xf1f5ff));
-        font.drawText(canvas, "Switch 2 RPG Maker Game Launcher (MV / MZ / VX Ace)  \xE2\x80\xA2  Native Switch 2 UI",
+        font.drawText(canvas, "SW2RPGMGL v" SW2RPGMGL_VERSION, padX, 18, 28, hexColor(0xf1f5ff));
+        font.drawText(canvas, "Switch 2 RPG Maker & WOLF RPG Launcher (MV / MZ / VX Ace / WOLF)  \xE2\x80\xA2  Native Switch 2 UI",
                       padX, 56, 15, hexColor(0x8b98b8));
 
         char countBuf[64];
@@ -1690,7 +1777,7 @@ int main(int argc, char* argv[]) {
 
                 // Engine badge pill
                 std::string badge = engineBadgeLabel(g.engine);
-                int badgeW = badge.size() > 3 ? 72 : 46;
+                int badgeW = badge.size() > 4 ? 72 : (badge.size() == 4 ? 58 : 46);
                 int badgeH = 24;
                 int badgeX = padX + listW - badgeW - 16;
                 int badgeY = cy + 13;
@@ -1714,6 +1801,14 @@ int main(int argc, char* argv[]) {
                     } else {
                         snprintf(metaBuf, sizeof(metaBuf), "%s/   \xE2\x80\xA2   no saves yet   \xE2\x80\xA2   %d plugin%s",
                                  g.folderName.c_str(), g.pluginCount, g.pluginCount == 1 ? "" : "s");
+                    }
+                } else if (g.engine == GameEngine::Wolf) {
+                    if (g.saveCount > 0) {
+                        snprintf(metaBuf, sizeof(metaBuf), "%s/   \xE2\x80\xA2   %d save%s   \xE2\x80\xA2   woditor arm64",
+                                 g.folderName.c_str(), g.saveCount, g.saveCount == 1 ? "" : "s");
+                    } else {
+                        snprintf(metaBuf, sizeof(metaBuf), "%s/   \xE2\x80\xA2   no saves yet   \xE2\x80\xA2   woditor arm64",
+                                 g.folderName.c_str());
                     }
                 } else {
                     if (g.saveCount > 0) {
@@ -1771,7 +1866,9 @@ int main(int argc, char* argv[]) {
                     ? !mvEnginePath.empty()
                     : (sel.engine == GameEngine::MZ)
                         ? !mzEnginePath.empty()
-                        : !mkxpzEnginePath.empty();
+                        : (sel.engine == GameEngine::Wolf)
+                            ? !wolfEnginePath.empty()
+                            : !mkxpzEnginePath.empty();
 
                 char savesStr[48], pluginsStr[48];
                 snprintf(savesStr, sizeof(savesStr), "%d save file%s", sel.saveCount, sel.saveCount == 1 ? "" : "s");
@@ -1793,6 +1890,14 @@ int main(int argc, char* argv[]) {
                         {"Saves", savesStr},
                         {"Plugins", pluginsStr},
                         {"Assets", sel.encrypted ? "Encrypted (.png_/.ogg_)" : "Unencrypted"},
+                    };
+                } else if (sel.engine == GameEngine::Wolf) {
+                    rows = {
+                        {"Engine", engineFullLabel(sel.engine)},
+                        {"Runtime", engineReady ? "wolf-engine-switch2.nro ready" : "Missing wolf-engine-switch2.nro!"},
+                        {"Saves", savesStr},
+                        {"Archive", sel.encrypted ? "Packed (.wolf)" : "Unpacked Data/"},
+                        {"Save Path", sel.folderName + "/Save/"},
                     };
                 } else {
                     rows = {

@@ -9,7 +9,16 @@ import { createAssetReader } from './assets';
 import { createBrowserHost } from './browser-host';
 import { discoverGames, inspectSingleMzGame, type GameEntry } from './games';
 import { createInputBridge } from './input';
-import { getSwitch, initLog, log, recentLogs, resolveLaunchArgs } from './log';
+import {
+  SW2RPGMGL_VERSION,
+  getSwitch,
+  initLog,
+  log,
+  logGameDiagnostics,
+  logRuntimeDiagnostics,
+  recentLogs,
+  resolveLaunchArgs,
+} from './log';
 import { mountIndexHtmlCanvases } from './mv-compat';
 import {
   createMzScriptPreparer,
@@ -39,12 +48,13 @@ async function launchMzGame(
   game: GameEntry,
   returnNroPath: string | null,
 ): Promise<void> {
-  log(`=== Launching MZ Game: "${game.title}" ===`);
-  log(`  gameDir: ${game.gameDir}`);
-  log(`  wwwRoot: ${game.wwwRoot}`);
-  log(`  saveDir: ${game.saveDir}`);
-
   const assets = createAssetReader(game.wwwRoot, sw);
+  logGameDiagnostics(sw, game, assets, {
+    rendererMode: 'Hardware WebGL2 (OunceVK ES3)',
+    displayMode: game.config.displayMode ?? 'fit',
+    filterMode: game.config.filterMode ?? 'auto',
+  });
+
   const scriptPreparer = createMzScriptPreparer(game.config.skipPlugins);
   const host = createBrowserHost(assets, scriptPreparer, screen, {
     gameTitle: game.title,
@@ -66,7 +76,7 @@ async function launchMzGame(
   const gl = host.ensureWebGLContext();
   const splash = createWebGLSplash(
     gl,
-    'SW2RPGMGL  •  RPG Maker MZ (kaiHEN / OunceVK WebGL2)',
+    `SW2RPGMGL v${SW2RPGMGL_VERSION}  •  RPG Maker MZ (kaiHEN / OunceVK WebGL2)`,
     '#3dd6a5',
   );
   await splash?.draw(game.title, 0.06, 'Initializing Switch 2 MZ runtime (WebGL2)...', game.gameDir);
@@ -125,6 +135,7 @@ async function launchMzGame(
   await installMzFontCompat(runtime, assets);
 
   await splash?.draw(game.title, 0.94, 'Starting RPG Maker MZ (WebGL2)...', 'Launching Scene_Boot');
+  logRuntimeDiagnostics(runtime, { skippedScripts: host.getSkippedScripts?.() });
   const input = createInputBridge();
   let fatalShown = false;
   installMzCompat(runtime, host, input, game, {
@@ -134,7 +145,7 @@ async function launchMzGame(
       fatalShown = true;
       const errSplash = createWebGLSplash(
         host.getWebGLContext(),
-        'SW2RPGMGL  •  RPG Maker MZ (kaiHEN / OunceVK WebGL2)',
+        `SW2RPGMGL v${SW2RPGMGL_VERSION}  •  RPG Maker MZ (kaiHEN / OunceVK WebGL2)`,
         '#3dd6a5',
       );
       const tail = recentLogs().slice(-6).join('\n');
@@ -258,13 +269,9 @@ async function preloadMzDatabase(
 }
 
 async function boot(): Promise<void> {
-  initLog();
+  initLog('mz.log', 'RPG Maker MZ Engine (WebGL2)');
   const sw = getSwitch();
   const { loaderDir, directGameDir, returnNroPath } = resolveLaunchArgs(sw?.argv);
-  log(
-    `Booting SW2RPGMGL — MZ Engine (WebGL2) ` +
-    `(dir=${loaderDir}${directGameDir ? `, game=${directGameDir}` : ''}${returnNroPath ? `, return=${returnNroPath}` : ''})`,
-  );
 
   let allowPlusExit = false;
   if (typeof globalThis.addEventListener === 'function') {

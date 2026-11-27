@@ -14,7 +14,7 @@ include $(DEVKITPRO)/libounce/switch2_rules
 
 APP_TITLE   := SW2RPGMGL
 APP_AUTHOR  := Switch 2 RPG Maker Game Launcher
-APP_VERSION := 0.3.1
+APP_VERSION := 0.3.2
 APP_ICON    := ../loader/icon.jpg
 
 TARGET      := SW2RPGMGL
@@ -27,6 +27,7 @@ ARCH        := $(SWITCH2_CPU) -mtp=soft -fPIE -ftls-model=local-exec
 
 CXXFLAGS    := -O2 -Wall -Wextra -std=c++20 -ffunction-sections -fdata-sections \
                $(ARCH) -D__SWITCH__ -D__SWITCH2__ -D_DEFAULT_SOURCE \
+               -DSW2RPGMGL_VERSION=\"$(APP_VERSION)\" \
                -I$(DEVKITPRO)/portlibs/switch2/include \
                -I$(DEVKITPRO)/portlibs/switch/include \
                -I$(DEVKITPRO)/portlibs/switch/include/freetype2 \
